@@ -1,0 +1,23 @@
+# --- Core RAG pipeline (Day 1) ---
+pdfplumber>=0.11            # PDF text extraction; better than pypdf on tables
+langchain-text-splitters>=0.3  # RecursiveCharacterTextSplitter for chunking
+sentence-transformers>=3.0  # local, free embeddings (bge-small)
+chromadb>=0.5              # local vector store that persists to disk
+
+# --- LLM clients (Day 1) ---
+groq>=0.11                 # Groq free-tier API client (primary LLM)
+# Ollama needs no pip package - it's a separate local app; we call its HTTP API.
+
+# --- Hybrid retrieval + eval (Day 2) ---
+rank-bm25>=0.2             # keyword (BM25) retrieval to combine with embeddings
+pandas>=2.0               # tabular eval results
+numpy>=1.26
+
+# --- Config / UI (Day 1 / Day 3) ---
+python-dotenv>=1.0        # load the GROQ_API_KEY from a .env file
+streamlit>=1.38           # simple demo UI (Day 3, optional)
+
+# Note on reproducibility: these are minimum-version pins so a clean clone
+# installs cleanly across platforms. Once your project works, run
+#   pip freeze > requirements.lock.txt
+# to capture exact versions for a fully frozen, reproducible environment.

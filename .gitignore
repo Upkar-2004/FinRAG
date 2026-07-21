@@ -1,0 +1,12 @@
+# Data is downloaded by scripts/prepare_data.py, never committed.
+data/
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+# Secrets
+.env
+# Vector store / caches
+*.sqlite3
+.cache/
