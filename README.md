@@ -56,4 +56,5 @@ data/                     # downloaded, gitignored
 - [x] Day 0 — data acquisition + held-out eval set
 - [ ] Day 1 — ingestion (parse → chunk → embed → index) + grounded answers with citations
 - [ ] Day 2 — evaluation harness, guardrails, hybrid retrieval, failure analysis, ablation
+      (retrieval hit@k = any retrieved chunk's `page_index` is in the question's `gold_pages`)
 - [ ] Day 3 — calculator tool, cost/latency logging, Streamlit demo, final README

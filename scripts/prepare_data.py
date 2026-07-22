@@ -42,7 +42,23 @@ def ensure_financebench_source() -> None:
 
 
 def build_eval_set() -> list[dict]:
-    """Filter the 150 questions down to our corpus and normalise the fields."""
+    """Filter the 150 questions down to our corpus and normalise the fields.
+
+    FinanceBench's `evidence_page_num` is 0-based and lines up directly with
+    pdfplumber's page index (verified empirically: for financebench_id_00499,
+    evidence_page_num=47 matches pdfplumber page index 47 — the physical 48th
+    page of 3M_2022_10K.pdf). So we treat it as our `page_index` convention
+    with no off-by-one conversion needed.
+
+    Some questions cite evidence spread across several pages (e.g. a metrics
+    question pulling from both the income statement and the cash flow
+    statement — 5 of our 29 kept questions do this). Keeping only the first
+    evidence page would understate retrieval quality whenever the right
+    chunk lands on page 2 or 3 of the evidence set. We keep every distinct
+    evidence page as `gold_pages`; `gold_page` (the first one) is kept
+    alongside it only for backward compatibility with anything still reading
+    the singular field.
+    """
     src = config.FINANCEBENCH_SRC / "data" / "financebench_open_source.jsonl"
     rows = [json.loads(line) for line in src.open()]
 
@@ -50,10 +66,10 @@ def build_eval_set() -> list[dict]:
     for r in rows:
         if r["doc_name"] not in config.CORPUS_DOCS:
             continue
-        # Each question lists one or more "evidence" entries with the gold page.
-        # We take the first evidence page as the retrieval ground truth.
-        evidence = r.get("evidence") or [{}]
-        gold_page = evidence[0].get("evidence_page_num")
+        evidence = r.get("evidence") or []
+        gold_pages = sorted(
+            {e["evidence_page_num"] for e in evidence if e.get("evidence_page_num") is not None}
+        )
         kept.append(
             {
                 "id": r["financebench_id"],
@@ -62,7 +78,8 @@ def build_eval_set() -> list[dict]:
                 "question": r["question"],
                 "answer": r["answer"],
                 "question_type": r["question_type"],
-                "gold_page": gold_page,       # 0-indexed page in the PDF
+                "gold_pages": gold_pages,                        # all evidence page_index values (0-based)
+                "gold_page": gold_pages[0] if gold_pages else None,  # first page, back-compat only
             }
         )
     return kept
@@ -107,6 +124,8 @@ def main() -> None:
     for r in eval_set:
         by_type[r["question_type"]] = by_type.get(r["question_type"], 0) + 1
     print(f"Question types   : {by_type}")
+    multi_page = sum(1 for r in eval_set if len(r["gold_pages"]) > 1)
+    print(f"Multi-page gold  : {multi_page}/{len(eval_set)} questions cite evidence on >1 page")
     print("\nPer document:")
     for doc, label in config.CORPUS_DOCS.items():
         n = sum(1 for r in eval_set if r["doc_name"] == doc)

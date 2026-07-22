@@ -10,3 +10,4 @@ venv/
 # Vector store / caches
 *.sqlite3
 .cache/
+.DS_Store
