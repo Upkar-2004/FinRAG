@@ -58,8 +58,13 @@ def embed_texts(model: SentenceTransformer, texts: list[str]) -> list[list[float
     return embeddings.tolist()
 
 
-def build_index(chunks: list[dict]) -> chromadb.Collection:
-    """Embed all chunks and persist them to a fresh Chroma collection."""
+def build_index(chunks: list[dict]) -> tuple[chromadb.Collection, SentenceTransformer]:
+    """Embed all chunks and persist them to a fresh Chroma collection.
+
+    Returns the collection AND the loaded model, so callers (like the
+    smoke test below) can reuse the same in-memory model instead of
+    loading bge-small's weights from disk a second time.
+    """
     config.VECTORSTORE_DIR.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(config.VECTORSTORE_DIR)) #PersistentClient is used to persist the collection to disk so it can be reloaded later without re-embedding everything.
 
@@ -85,20 +90,20 @@ def build_index(chunks: list[dict]) -> chromadb.Collection:
             documents=texts[start:end],
             metadatas=metadatas[start:end],
         )
-    return collection
+    return collection, model
 
 
 if __name__ == "__main__":
     chunks = chunk_corpus()
     print(f"\nEmbedding + indexing {len(chunks)} chunks with {config.EMBEDDING_MODEL} ...")
-    collection = build_index(chunks)
+    collection, model = build_index(chunks)
     print(f"[ok] Collection '{COLLECTION_NAME}' has {collection.count()} vectors, persisted to {config.VECTORSTORE_DIR}")
 
     # Smoke test: embed one question the same way and eyeball the top hits.
     # This is NOT the retrieval stage (no MIN_RELEVANCE_SCORE gating, no
     # gold_pages comparison) — just a sanity check that similar text lands
-    # near similar text.
-    model = SentenceTransformer(config.EMBEDDING_MODEL)
+    # near similar text. Reuses the `model` returned by build_index() above
+    # instead of loading bge-small's weights into memory a second time.
     query = "Represent this sentence for searching relevant passages: What are the major products AMD sells?"
     query_embedding = model.encode([query], normalize_embeddings=True).tolist()
     results = collection.query(query_embeddings=query_embedding, n_results=3)
