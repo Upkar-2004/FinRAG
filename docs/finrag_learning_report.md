@@ -19,6 +19,8 @@
 11. [Next Steps / Roadmap From Here](#11-next-steps--roadmap-from-here)
 12. [Interview Defense Section — "How I Would Explain This In An Interview"](#12-interview-defense-section--how-i-would-explain-this-in-an-interview)
 13. [Addendum: BM25 Baseline (Stage 3b)](#13-addendum-bm25-baseline-stage-3b)
+14. [Issues, Bugs, and Near-Misses Encountered Along the Way](#14-issues-bugs-and-near-misses-encountered-along-the-way)
+15. [Broader Failure Analysis: Four More Diagnosed Cases](#15-broader-failure-analysis-four-more-diagnosed-cases)
 
 ---
 
@@ -823,6 +825,183 @@ misses -> min=12.078  mean=33.241  max=90.434
 Misses have both a *higher* mean and a dramatically higher max than hits — the single highest BM25 score across all 29 questions (90.434) belongs to a **miss** (`financebench_id_03620`, a `metrics-generated` PepsiCo question). Financial statement pages are dense with repeated numeric/line-item vocabulary, so a page can accumulate a large raw BM25 score without being the specific page a computed-metric question actually needs. This reinforces — more sharply than the dense case — that a raw relevance score is not a substitute for ground-truth evaluation, regardless of which retrieval algorithm produced it.
 
 **Still untested:** whether `k1=1.5`/`b=0.75` (rank_bm25's defaults) are well-suited to short, table-heavy financial-filing chunks — no parameter ablation has been run.
+
+---
+
+## 14. Issues, Bugs, and Near-Misses Encountered Along the Way
+
+*This section exists on purpose. A polished final report can make a project look like it went smoothly in a straight line — it didn't, and pretending otherwise would make this a worse study document, not a better one. Every entry below follows the same shape: what happened, why it happened (the actual mechanism, not just "oops"), how it was found, how it was fixed, and the general lesson worth keeping past this specific project. Several of these are exactly the kind of "tell me about a bug you found" story that comes up in interviews.*
+
+### 14.1 The `-m` flag confusion — filesystem paths vs. dotted module paths
+
+**What happened:** running `python3 -m src/finrag.index.py`, then `python3 -m src/finrag/index.py`, then `python3 -m src/finrag/index` all failed with `ModuleNotFoundError`.
+
+**Why:** `-m` expects a **dotted module path** — written the same way you'd write it in an `import` statement (`src.finrag.index`) — not a filesystem path. Slashes and `.py` extensions don't belong there at all; Python resolves the dots into directory separators itself, internally, using `sys.path`.
+
+**The fix:** `python3 -m src.finrag.index`.
+
+**A related trap worth knowing:** even `python3 src/finrag/index.py` (direct execution, no `-m` at all) would *also* fail — but with a completely different error: `ImportError: attempted relative import with no known parent package`. That's because `index.py` contains `from .ingest import chunk_corpus` — a relative import that only resolves when Python has loaded the file *as part of a package*, which is exactly what `-m` does and direct script execution does not.
+
+**General lesson:** `-m` and plain file execution set up Python's import machinery differently. Relative imports (the leading dot) require the module to be loaded via `-m` or as part of a properly installed package — they will never work when a file is just run directly as a standalone script.
+
+### 14.2 The shell history-expansion incident — a real, if harmless, scare
+
+**What happened:** I handed over a `python3 -c "..."` command containing the Python format-spec `{h['text'][:80]!r}` (a normal, valid f-string conversion — "call `repr()` on this"). The terminal returned a `SyntaxError`, and the displayed command showed `{h['text'][:80]rm -rf .git}` instead of what was actually written.
+
+**Why this happened — the real mechanism:** bash and zsh both perform **history expansion**: any `!` followed by characters gets expanded to the most recent command in your shell history that starts with those characters, and — critically — **this happens even inside double-quoted strings** (though not single-quoted ones). The shell saw `!r` inside the double-quoted command, searched history for the most recent command starting with "r", and found `rm -rf .git`. It substituted that entire command in as literal text, *before* Python ever received the string — so what Python actually tried to parse was garbled, and correctly refused with a syntax error.
+
+**Why it wasn't actually dangerous:** the substitution happened *inside* a string being assembled for `python3 -c`, not as a free-standing shell command of its own. It never got a chance to execute as `rm -rf .git` — it just corrupted the Python source text, which is why Python's parser rejected it instead of anything being deleted. We verified this directly: `git log` and `git status` immediately afterward showed the repository completely intact, all commits present.
+
+**What it revealed, independent of the incident itself:** the command `rm -rf .git` exists somewhere in that shell's history — worth being aware of, since a future accidental `!r` (or any `!`-prefixed text matching it) in the *wrong* directory could actually execute it for real.
+
+**The fix going forward:** stopped inlining nontrivial code into `python3 -c "..."` one-liners wrapped in double quotes. Switched to writing scripts out to actual files and running `python3 path/to/file.py` — this sidesteps the entire class of shell-quoting hazards (history expansion, but also normal quoting/escaping bugs) rather than trying to carefully avoid every dangerous character by hand.
+
+**General lesson:** double-quoted strings in bash/zsh are not "safe" the way they might look — `!`, `$`, and backticks are all live inside them. Single-quoted strings are inert (no expansion of any kind), but can't contain unescaped single quotes themselves. When code has any of these characters, a real file is safer than a shell one-liner.
+
+### 14.3 The double model-load bug in `index.py`'s smoke test
+
+**What happened:** running `index.py` printed `Loading weights: 100%|...` **twice** in one run.
+
+**Why:** `build_index()` created its own `SentenceTransformer` instance internally to do the embedding. The `__main__` block's smoke test, written separately below it, *also* created its own independent `SentenceTransformer` instance for its own use — with no awareness that `build_index()` had already loaded one moments earlier.
+
+**How it was found:** not by reasoning about the code — by actually reading the real terminal output and asking "why does this print twice?" This is a good example of a bug that's essentially invisible from reading the code casually (both instantiations look individually reasonable) but obvious the moment you watch real output.
+
+**The fix:** changed `build_index()`'s return type from just the `Collection` to a tuple of `(Collection, SentenceTransformer)`, so the caller could reuse the already-loaded model instead of constructing a second one.
+
+**General lesson:** redundant, expensive operations often hide in plain sight in code that "works fine" — nothing crashes, nothing produces a wrong answer, it's just silently wasteful. Reading actual program output, not just source code, is often what catches this class of issue.
+
+### 14.4 The stale Chroma collection cache — caught before it ever broke anything
+
+**What happened:** while *designing* `ablate_chunking.py` (which rebuilds the vector index multiple times inside one running Python process — one rebuild per chunk-size config), we recognized in advance that `retrieve.py`'s cached `_collection` variable would keep pointing at the *first* trial's collection object even after that collection had been deleted and recreated for trial two.
+
+**Why:** the lazy-singleton caching pattern (build once, reuse forever) was designed under an assumption that held for every script up to that point — "the index is built exactly once per process" — which is true for `index.py` and `retrieve.py` used normally, but false for an ablation loop that deliberately rebuilds the index several times in a row.
+
+**How it was found:** not by running the ablation script and watching it fail — by deliberately asking, before writing that script, "what happens to every existing caching assumption under this new usage pattern?" This is a case of catching a bug through design review rather than through a runtime failure.
+
+**The fix:** added an explicit `reset_collection_cache()` function to `retrieve.py`, called immediately after every `build_index()` call inside the ablation loop, forcing the next `retrieve()` call to reconnect rather than reuse a stale reference.
+
+**General lesson:** this is the classic "cache invalidation" problem in miniature. A caching strategy that is completely correct for one usage pattern can become silently wrong under a new one — and the danger is specifically that it *won't crash*, it'll just quietly serve stale data. Any time a cached resource's underlying data can change during a process's lifetime, there needs to be an explicit, deliberate way to invalidate that cache — it doesn't happen automatically.
+
+### 14.5 The `gold_page` truncation bug — evaluation ground truth was silently wrong
+
+**What happened:** the original data-prep code took only the *first* FinanceBench evidence page per question as "the" gold page, silently discarding any additional evidence pages.
+
+**Why this is dangerous, specifically:** it doesn't crash, and it doesn't look wrong by inspection — `gold_page = evidence[0].get("evidence_page_num")` is completely valid, unremarkable-looking Python. The only way to find the problem was to go look at the actual data.
+
+**How it was found:** by explicitly checking, rather than assuming — inspecting FinanceBench's raw records for our 29 kept questions and counting how many had more than one evidence page. Answer: 5 of 29. One example, `financebench_id_00499`, needs evidence from three different financial statements (pages 47, 49, 51) to answer a single question about capital intensity.
+
+**The fix:** `gold_pages` (plural — a deduplicated, sorted list of every valid evidence page) became the real ground truth; `gold_page` (singular) was kept only as `gold_pages[0]`, for backward compatibility, never as a source of truth.
+
+**General lesson:** bugs in evaluation ground truth are especially dangerous because they don't produce an error — they produce a *confidently wrong number*. A retrieval system that correctly found the right passage on page 49 would have been scored as having failed, and nothing about that failure would look like a bug from the metrics alone. This is why it's worth periodically auditing your own labels, not just your model's outputs.
+
+### 14.6 The ambiguous page-numbering convention — a near-miss on a real off-by-one
+
+**What happened:** the original code used a single field just called `"page"` everywhere — in FinanceBench's data, in pdfplumber's extraction, in chunk metadata — with no indication of whether it was 0-based or 1-based.
+
+**Why this was risky:** two *different* systems (FinanceBench's own page annotations and pdfplumber's PDF-parsing library) were both producing "page numbers," and there was no guarantee they used the same convention. This is one of the most common, most silent sources of off-by-one bugs in any pipeline that crosses two independently-built systems — everything keeps running, every comparison keeps "working," and the results are simply wrong by one page, indefinitely, until someone happens to manually check a citation against the source PDF.
+
+**How it was verified — not assumed:** opened `3M_2022_10K.pdf` directly with pdfplumber and cross-checked a real example: FinanceBench's `evidence_page_num=47` for `financebench_id_00499`, against the actual text at `pdfplumber.pages[47]`. They matched exactly (the 3M Consolidated Statement of Income). Conclusion, now backed by evidence rather than assumption: both systems are 0-based, no conversion needed.
+
+**The fix:** split the single ambiguous `"page"` field into two explicitly-named ones — `page_index` (0-based, the *only* field ever compared against `gold_pages`) and `page_number` (1-based, `page_index + 1`, used only for human-facing citation display, explicitly documented as not necessarily matching the number physically printed on the page).
+
+**General lesson:** whenever two different numbering (or indexing) conventions could plausibly exist for "the same" real-world concept, give them different variable names *immediately*, before writing any code that compares them — and verify the actual convention empirically, don't assume it from documentation or intuition alone.
+
+### 14.7 The chunk-boundary failure — a concrete, diagnosed retrieval miss
+
+**What happened:** `financebench_id_00995` ("what products does AMD sell," gold page 3) consistently failed to retrieve, across every configuration tested.
+
+**Diagnosis:** extracted the actual text of AMD's page 3 directly and found that the real answer — a short "Overview" paragraph — sits at character 3,330 out of the page's 3,971 total characters, right at the very end; the rest of the page (84% of it) is a generic "forward-looking statements" legal disclaimer common to nearly every 10-K. At `chunk_size=1000`, the resulting chunk boundary fell almost exactly at the worst possible spot: one chunk ended up with the "Overview" section header buried at its tail, drowned in disclaimer text; the *next* chunk had the actual bulleted product list, but with no header left to give it context.
+
+**General lesson:** chunking is not a cosmetic implementation detail that "just works" with any reasonable-sounding parameters. Where a chunk boundary falls can determine whether an easy, obviously-answerable question is retrievable *at all* — independent of how good the underlying embedding model is.
+
+### 14.8 The disconfirmed chunk-size hypothesis — a hypothesis that turned out wrong, and that was still useful
+
+**What happened:** based on 14.7, we hypothesized that smaller chunks (avoiding long boilerplate-heavy pages getting merged with short answer sections) might fix this class of failure. Tested it directly with `ablate_chunking.py`.
+
+**Result: the hypothesis was wrong.** Recall@5 got *worse* at both a smaller chunk size (500 chars → 27.6%) and a larger one (1500 chars → 27.6%) compared to the original default (1000 chars → 34.5%). A further, more targeted check showed the specific AMD case never entered the top-5 results at *any* of the three tested sizes — not a near-miss that a slightly different size might have flipped.
+
+**The deeper diagnosis that followed:** digging into *why* revealed the true blocker wasn't actually the boundary cut — it was that a specific wrong passage (AMD's product-warranty section) consistently out-scored the correct one at every chunk size, and its similarity score *increased*, not decreased, as chunks got larger. The wrong passage is a genuine semantic distractor (it shares real vocabulary with the query), which chunk-size tuning has no mechanism to fix.
+
+**General lesson:** a plausible, well-reasoned hypothesis can still be flatly wrong, and the only way to find out is to actually measure it — reasoning alone, however careful, is not a substitute for an experiment. Equally important: a "failed" experiment that rules a hypothesis out is real, valuable progress, not wasted effort — it directly redirected the investigation toward the actual mechanism (semantic confusability) instead of continuing to tune a parameter that wasn't the problem.
+
+### 14.9 The BM25 baseline losing — a confirmed prediction, and a sharper version of an earlier finding
+
+**What happened:** built a completely independent, non-neural retrieval method (BM25, pure keyword counting) and measured it with the identical evaluation harness used for dense retrieval. Result: BM25 Recall@5 = 13.8% (4/29), well below dense retrieval's 34.5%.
+
+**Why this belongs in an "issues" section despite being a successful experiment:** before measuring, the report explicitly predicted BM25 would likely *also* fail the AMD case (14.7/14.8), since the wrong distractor passage shares literal query vocabulary too, not just topical similarity — and that prediction held up exactly (`financebench_id_00995` was still a miss under BM25). It also surfaced an even starker version of the "similarity score isn't correctness" finding from Section 8: BM25's misses scored *higher on average* than its hits, and the single highest score across all 29 questions in that entire run belonged to a miss.
+
+**General lesson:** a "negative" result for a simpler alternative approach is exactly the kind of finding that justifies *not* using that simpler approach going forward — it converts "dense retrieval is probably better" from an assumption into a measured fact, which is a categorically stronger thing to say in an interview.
+
+### 14.10 Process note: staying disciplined about who runs what
+
+Earlier in this project, pipeline commands (`prepare_data.py`, `ingest.py`, `index.py`) were run directly rather than being handed over to run and observe firsthand. This was explicitly corrected, and the standing approach since has been: code gets written and explained in detail first, the exact command to run it gets handed over, and it gets run and reported back — except in the specific cases where running it directly was explicitly requested (e.g., the AMD-case diagnostic in Section 13, and the four commits in the current git history). This is a process lesson as much as a technical one: the value of this project is in *understanding* every piece well enough to defend it, and that's much harder to build secondhand.
+
+---
+
+## 15. Broader Failure Analysis: Four More Diagnosed Cases
+
+*Everything in Sections 4, 8, and 14.7–14.8 was built on deeply understanding exactly one failure (`financebench_id_00995`, the AMD products question). That's a sample size of one out of 19 dense-retrieval misses — not enough to know whether its specific mechanism (a semantically confusable wrong passage) is the typical failure or an unusual one. Before committing to a specific fix, four more misses were deliberately chosen for variety — a numeric-ratio question, the single highest-scoring miss across the entire 29-question run, a question whose answer is an absence ("no legal battles"), and a second geography question to compare against the PepsiCo one BM25 solved — and diagnosed the same way: pull the actual gold page text, compare against what was actually retrieved.*
+
+*Note: before running this analysis, the persisted vector store on disk was found to still reflect the 1500-character chunk-size trial from the chunking ablation (Section 14.4's caching discussion doesn't cover this — this was a leftover from `check_amd_case.py` simply never rebuilding the default afterward). It was rebuilt with the correct default (1000/150, 4,961 chunks, verified by collection count) before any of the results below were gathered.*
+
+### Case 1 — `financebench_id_00222`, AMD quick ratio (gold page 55)
+
+**Question:** *"Does AMD have a reasonably healthy liquidity profile based on its quick ratio for FY22?"*
+
+Gold page 55 is AMD's actual Consolidated Balance Sheet — Cash and cash equivalents, Short-term investments, Accounts receivable, Total current assets, exactly the line items the gold answer's 1.57 quick ratio is computed from.
+
+**What got retrieved instead:** three of the five results were from **American Express**, not AMD at all — passages discussing AmEx's own "minimum leverage ratio requirements" and "well-capitalized ratios." The remaining two were AMD pages, but neither was the balance sheet (one was the familiar forward-looking-statements boilerplate, the other a generic passage about "portfolio liquidity").
+
+**Diagnosis: cross-document contamination, directly observed.** The query used generic financial-concept language ("liquidity profile," "quick ratio"), and the embedding model matched on that generic financial vocabulary across company boundaries — pulling in an entirely different filing that happens to discuss liquidity/ratios in similarly-shaped language. This is exactly the risk that was named (Section 8) as the reason whole-corpus retrieval is the *harder, more honest* task compared to filtering by known company — here it's no longer a hypothetical, it's measured, on a real question.
+
+### Case 2 — `financebench_id_01981`, AmEx card member retention (gold page 44)
+
+**Question:** *"Was American Express able to retain card members during 2022?"* (gold answer: simply "Yes")
+
+This is the single **highest-scoring miss across the entire 29-question evaluation** — similarity 0.773, higher than every one of the 10 actual hits. What won: a passage listing countries AmEx operates in ("United Kingdom, EU, Australia, Japan, Canada, Mexico...") — confident, broad business-overview language that has essentially nothing to do with card member retention.
+
+### Case 3 — `financebench_id_00735`, PepsiCo legal battles (gold page 25)
+
+**Question:** *"Has Pepsico reported any materially important ongoing legal battles?"* (gold answer: *"No, Pepsico is not involved in material legal battles."*)
+
+Gold page 25 is actually **Item 2 (Properties)** in PepsiCo's 10-K — the brief "we have no material legal proceedings" statement (Item 3) almost certainly sits right after it on the same page, a short sentence easily overshadowed by a page mostly about corporate real estate. None of the 5 retrieved chunks were even topically close to "legal" content.
+
+**Diagnosis: retrieving an absence is a structurally different problem.** There is no rich, positive passage describing "PepsiCo's legal battles" to match against — the entire point of the source text is that the topic doesn't apply. Both dense similarity and (presumably) keyword matching are built to find text that's *about* a topic; neither has a natural mechanism for retrieving text that briefly states a topic's *absence*. Flagged as a hypothesis worth testing on more examples, not a proven pattern from a single case.
+
+### Case 4 — `financebench_id_01028`, AmEx primary geographies (gold page 154)
+
+**Question:** *"What are the geographies that American Express primarily operates in as of 2022?"* (gold answer: *"United States, EMEA, APAC, and LACC"*)
+
+Gold page 154 is a **geographic revenue table** — region labels and dollar figures, thin on descriptive prose. Same structural shape as Case 1's balance sheet. **Never retrieved, at any point.** And tellingly: the exact same AmEx "page 5" chunk that won Case 2 also won here, for a completely different question.
+
+### Synthesis — four patterns, not one, and none of them are the original AMD case
+
+1. **Cross-document drift is real and measured, not theoretical** (Case 1). Generic financial vocabulary in a query can pull in content from an entirely different company's filing.
+2. **Financial tables appear to embed poorly, independent of chunk size** (Cases 1 and 4). Both correct gold pages are numeric tables with thin surrounding prose, and neither was ever retrieved at *any* of the three chunk sizes tested in Section 14.8. This looks like a deeper representational limitation than a chunking-boundary problem — sentence-embedding models, trained overwhelmingly on natural prose, may simply be a poor fit for raw tabular text, and no amount of chunk-size tuning would be expected to fix that.
+3. **Specific "generic overview" chunks act as repeat attractors across unrelated questions** — not a one-off. AmEx's page 5 won for two different questions (Cases 2 and 4); AMD's page 11 won the original diagnosed case (Section 14.7). Broadly-worded, confidently-phrased business-overview passages appear to be systematically over-favored by the embedding model, regardless of the specific question asked.
+4. **Negation/absence questions may be structurally hard for any single-signal retrieval method** (Case 3) — a hypothesis from one example, worth checking against more cases before treating as established.
+
+### What this changes about the roadmap (Section 11)
+
+Two concrete levers emerged from the analysis above — but the first one was then directly measured, with a surprising result.
+
+**Measured: cross-document drift, filtered out, rescues zero questions.** Chroma's `where={"doc_name": ...}` filter was used to rerun evaluation restricted to each question's own known company:
+```
+Whole-corpus Recall@5: 10/29 (34.5%)  <- current retrieve.py behavior
+Doc-scoped Recall@5:   10/29 (34.5%)  <- if we always knew the right company
+Questions rescued ONLY by knowing the right company: 0
+```
+This contradicts the naive takeaway from Case 1 above. Cross-document contamination is real and directly observable (American Express chunks did appear in an AMD query's top-5) — but removing it entirely doesn't change a single outcome, because the correct page (AMD's balance sheet) was *also* losing to other, wrong AMD chunks even with cross-document competition removed. The contamination was visible but never the actual bottleneck. **Conclusion: building a query-based company-detection step (inferring the company from the question text, e.g. "AMD" appearing literally in the question, then filtering) is not worth building — it's measured, not assumed, to have zero effect on Recall@5.** This is exactly the kind of thing worth measuring before building: an intuitive, example-motivated fix that turned out not to move the number at all.
+
+**Table serialization was built and tested — also measured, also negative.** `src/finrag/ingest.py` was extended to pull each page's tables via pdfplumber's structure-aware `extract_tables()` and serialize them into clean, row-ordered text (empty/None cells stripped, e.g. `"Cash and cash equivalents $ 4,835 $ 2,535"`), added as supplementary chunks (`source: "table"`) alongside the normal text chunks. The index grew from 4,961 to 5,659 chunks, and a direct check confirmed the AMD balance-sheet table chunk was created correctly and reads cleanly.
+
+**Result: Recall@5 stayed at exactly 10/29 (34.5%), unchanged.** Both directly-targeted cases (`financebench_id_00222`, AMD quick ratio; `financebench_id_01028`, AmEx geographies) are still misses. A further check made this more precise than a simple miss: **the gold table chunk doesn't appear even in the top-30 results within its own document** — not a near-miss ranked just outside the cutoff, but genuinely far away in embedding space from how the question gets represented.
+
+**Why, most likely:** two compounding issues, not one.
+1. `bge-small` was trained to represent natural-language sentence *meaning*. A row of numbers with short labels, however cleanly formatted, still isn't a natural-language sentence — cleanliness wasn't the actual bottleneck, representational mismatch was.
+2. Specific to the quick-ratio case: **the phrase "quick ratio" never appears anywhere in AMD's balance sheet.** It's a *computed* metric — the gold answer (1.57) is derived by combining four separate raw line items, none of which individually states or implies "quick ratio." No retrieval method — dense, BM25, or a cleaner table representation — can find a passage containing words and concepts it doesn't contain. This is a strong, concrete explanation for why `metrics-generated` has scored exactly **0/2 across every single configuration tested so far** (both dense chunk sizes, BM25, and now table serialization) — it may not be a retrieval quality problem at all for this question category.
+
+**Taking stock: three consecutive fix attempts (chunk-size tuning, doc-scoped filtering, table serialization), three negative results on the aggregate metric.** This is a meaningful pattern, not bad luck — it suggests the remaining ~19 misses are not primarily explained by chunking, cross-document noise, or table formatting, and that further tuning along those same axes is unlikely to move the number much further. Two different directions look more promising for what's actually left: **query-side rewriting** (expanding "quick ratio" into the raw line-item terms a query would need to actually match retrievable content, attacking the vocabulary gap from the query side instead of the document side) and **treating computed-metric questions as a fundamentally different pipeline path** — retrieve the raw source numbers (even imperfectly) and *compute* the answer downstream, rather than expecting a single retrieved passage to already state it. Notably, this second direction is not a new idea invented here — it's exactly what the project's own original roadmap (Section 1) already scheduled for Day 3: a calculator tool. This failure analysis is the first concrete, measured justification for *why* that tool is necessary, rather than just a nice-to-have.
 
 ---
 
