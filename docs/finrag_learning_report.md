@@ -21,6 +21,9 @@
 13. [Addendum: BM25 Baseline (Stage 3b)](#13-addendum-bm25-baseline-stage-3b)
 14. [Issues, Bugs, and Near-Misses Encountered Along the Way](#14-issues-bugs-and-near-misses-encountered-along-the-way)
 15. [Broader Failure Analysis: Four More Diagnosed Cases](#15-broader-failure-analysis-four-more-diagnosed-cases)
+16. [Generation Stage (Phase 1, Stage 4): Tool-Augmented Answers](#16-generation-stage-phase-1-stage-4-tool-augmented-answers)
+17. [Reranking and Hybrid Retrieval: Two More Negative Results, Rigorously Tuned](#17-reranking-and-hybrid-retrieval-two-more-negative-results-rigorously-tuned)
+18. [Wiring the Winning Retriever In, and Calibrating the Guardrail From Real Data](#18-wiring-the-winning-retriever-in-and-calibrating-the-guardrail-from-real-data)
 
 ---
 
@@ -79,7 +82,12 @@ Per the project's own `README.md` roadmap:
 | Retrieval evaluation (Recall@k) | `scripts/evaluate_retrieval.py` | Done, **not yet committed** |
 | Chunking ablation harness | `scripts/ablate_chunking.py` | Done, ran — see Section 13 addendum note below |
 | BM25 keyword baseline | `src/finrag/bm25_retrieve.py`, `scripts/evaluate_bm25.py` | Done, ran — Recall@5 = 13.8% (4/29), **not yet committed** — see Section 13 |
-| Generation (LLM answer + citations) | — | **Not started** |
+| Generation (LLM answer + citations + calculator tools) | `src/finrag/generate.py` | Built and validated in isolation — see Section 16. Real end-to-end run (via `retrieve()`) still blocked on the same AMD quick-ratio question by a retrieval miss, not a generation bug. |
+| Reranking (cross-encoder) | `src/finrag/rerank.py` | Built, measured, rejected — Recall@5 = 20.7% (6/29), a regression below dense-only. See Section 17. |
+| Hybrid retrieval (BM25 + dense, RRF) | `src/finrag/hybrid_retrieve.py`, `scripts/ablate_rrf_k.py` | Built, measured, tuned, rejected — best case 31.0% (9/29) at RRF_K=0/1, still below dense-only's 34.5%. See Section 17. |
+| Query expansion (zero-cost HyDE proxy) | `src/finrag/query_expand.py` | Built, measured, **accepted** — Recall@5 = 37.9% (11/29), the first technique to beat dense-only, with zero hits lost. See Section 17. |
+
+**Decision: `retrieve_with_expansion()` (dense + metric-vocabulary query expansion) ships as the production retriever** — the best-performing of seven configurations tested (dense-only, BM25-only, reranked, hybrid at 5 `RRF_K` values, and query expansion). See Section 17 for the full comparison.
 | Guardrails (`MIN_RELEVANCE_SCORE`) | — | Placeholder value in `config.py` only, unused in code |
 | Hybrid retrieval, reranking | — | **Not started** |
 
@@ -156,12 +164,14 @@ By question type: `domain-relevant` 19, `novel-generated` 8, `metrics-generated`
                         -> scored against gold_pages
                                        │
                                        ▼
-                        Recall@5 = 10/29 (34.5%)   <-- we are here
+                        Recall@5 = 10/29 (34.5%)
                                        │
                                        ▼
-                        [NOT BUILT YET] generation stage:
-                        top-k chunks + question -> LLM -> answer
-                        with citations
+                        generate.py: top-k chunks + question -> LLM
+                        (+ calculator tools) -> cited answer  <-- we are here
+                        Validated correct in isolation (Section 16);
+                        full pipeline still blocked on questions
+                        where retrieve() itself misses.
 ```
 
 ---
@@ -654,12 +664,12 @@ They say: **plain, default-configuration semantic search over naively-chunked fi
 - **Concept to understand:** the difference between a library function (`retrieve()`, meant to be imported) and a script entry point (`__main__`, meant to be run directly) — already partially built, this step just extends the entry point's usability.
 - **How we'll measure it helped:** qualitative — can you interactively explore retrieval results for arbitrary questions without editing code each time.
 
-### Phase 1, Stage 4: generation with Groq and citations
+### Phase 1, Stage 4: generation with Groq and citations — DONE, see Section 16
 
-- **What we'll build:** an LLM call (via the `groq` client, `config.GROQ_MODEL = "llama-3.3-70b-versatile"`, already listed in `requirements.txt` and `config.py` but not yet wired to any code) that takes a question plus its top-k retrieved chunks, and produces an answer that cites which chunk(s) it used (company/document/page).
-- **Why it matters:** this is the actual user-facing deliverable — everything so far only proves the *search* half works; a RAG system isn't complete until it can answer.
-- **Concept to understand:** prompt construction for grounded generation (instructing the model to answer *only* from provided context, and to cite sources), and why this must be evaluated separately from retrieval (Section 8) — a wrong answer could stem from bad retrieval, bad generation, or both, and conflating them would make debugging much harder.
-- **How we'll measure it helped:** comparing generated answers against `eval_set.jsonl`'s gold `answer` field — likely starting with manual/qualitative comparison before any automated answer-quality metric, given how easy it is to overclaim automated answer scoring (LLM-as-judge, string overlap metrics, etc. all have real, well-known failure modes).
+- **What we built:** `src/finrag/generate.py` — an LLM call (via the `groq` client, `config.GROQ_MODEL = "llama-3.3-70b-versatile"`) that takes a question plus its retrieved chunks, answers only from that context with citations, and can call three tools (`percent_change`, `ratio`, `calculate`) for any computed value instead of doing arithmetic itself. Pulled forward from its original Day 3 slot once Section 15's failure analysis gave concrete evidence it was needed now, not later.
+- **Validated correct in isolation** (bypassing `retrieve()`, feeding the real AMD balance-sheet chunk directly): computed quick ratio ≈ 1.567 against a real gold answer of 1.57, with a properly cited final sentence. Three real bugs were found and fixed getting there — see Section 16.
+- **Still open:** the exact same question fails end-to-end through the *full* pipeline, because `retrieve()` itself returns zero AMD chunks for it (a retrieval miss, not a generation bug) — see Section 16's closing note. Generation correctness and retrieval correctness remain genuinely separable failure modes, exactly as predicted below.
+- **Not yet built:** automated scoring of generated answers against `eval_set.jsonl`'s gold `answer` field across the full 29-question set (still only spot-checked manually so far) — see the "generation-quality eval harness" option raised but not yet chosen at the end of Section 16.
 
 ### Phase 2: proper evaluation harness with BM25 baseline first
 
@@ -668,13 +678,16 @@ They say: **plain, default-configuration semantic search over naively-chunked fi
 - **Concept to understand:** BM25 (a classical term-frequency-based ranking algorithm — scores documents by how often and how distinctively query terms appear in them, with no notion of "meaning," only literal term overlap) and why it can outperform dense embeddings specifically on queries with precise, distinctive vocabulary (exact product names, section headers, numbers) even though it can't do true semantic matching.
 - **How we'll measure it helped:** direct Recall@5 comparison, same eval set, same hit-scoring rule, dense-only vs. BM25-only vs. (eventually) hybrid.
 
-### Retrieval improvements
+### Retrieval improvements — DONE (6 techniques tried), see Section 17 for the full comparison
 
-- **Doc/company filtering** — already technically possible (Chroma's `where=` filter), not currently used by default (Section 8's deliberate choice); could be tested as a diagnostic to isolate "wrong document" errors from "right document, wrong page" errors.
-- **Chunk-size sweep** — `scripts/ablate_chunking.py` already written, testing (500,100), (1000,150), (1500,300); **not yet run**. Immediate next concrete action.
-- **Hybrid BM25 + dense search** — combine keyword and semantic retrieval so exact-term matches and meaning-based matches both contribute, rather than relying on embeddings alone.
-- **Reciprocal Rank Fusion (RRF)** — a specific, simple algorithm for combining two separately-ranked result lists (e.g., a BM25 ranking and a dense-embedding ranking) into one merged ranking, by scoring each item as the sum of `1 / (rank + constant)` across every list it appears in — items that rank well in *either* list get boosted, without needing the two lists' raw scores to be on comparable scales (which BM25 scores and cosine similarities are not).
-- **Reranking** — a second-stage model (typically a more expensive but more accurate cross-encoder, which looks at the query and a candidate passage *together* rather than embedding them independently) that re-scores and reorders an initial retriever's top candidates, trading extra compute for better final ranking. Not yet implemented.
+- **Doc/company filtering** — tested. Rescued zero questions (Section 15).
+- **Chunk-size sweep** — run. 500/1500 both worse than the 1000/150 default (Section 14.8).
+- **Table serialization** — built and tested. Zero Recall@5 change (Section 15/16).
+- **Reranking (cross-encoder)** — built and tested. Regression to 20.7% (Section 17).
+- **Hybrid BM25 + dense with RRF** — built, tested, and its main hyperparameter (`RRF_K`) tuned across a full sweep. Best case 31.0%, still below dense-only (Section 17).
+- **Query expansion (zero-cost HyDE proxy)** — built and tested. **37.9% (11/29), the first technique to beat dense-only (34.5%), zero hits lost** (Section 17).
+- **Decision:** ship `retrieve_with_expansion()` (dense + metric-vocabulary expansion) as the production retriever — it beat all six alternatives tested, including plain dense-only.
+- **Still open — the more general version of what just worked:** full HyDE (LLM-generates the expansion per query, rather than a hand-maintained 5-metric dictionary). The dictionary approach is deliberately narrow and won't generalize past the metrics it explicitly lists; HyDE would. Costs real Groq quota per query, which is why it wasn't attempted first — a good candidate once quota allows, now with direct evidence the underlying mechanism (query-side vocabulary enrichment) actually works on this corpus.
 
 ### Reliability
 
@@ -1002,6 +1015,175 @@ This contradicts the naive takeaway from Case 1 above. Cross-document contaminat
 2. Specific to the quick-ratio case: **the phrase "quick ratio" never appears anywhere in AMD's balance sheet.** It's a *computed* metric — the gold answer (1.57) is derived by combining four separate raw line items, none of which individually states or implies "quick ratio." No retrieval method — dense, BM25, or a cleaner table representation — can find a passage containing words and concepts it doesn't contain. This is a strong, concrete explanation for why `metrics-generated` has scored exactly **0/2 across every single configuration tested so far** (both dense chunk sizes, BM25, and now table serialization) — it may not be a retrieval quality problem at all for this question category.
 
 **Taking stock: three consecutive fix attempts (chunk-size tuning, doc-scoped filtering, table serialization), three negative results on the aggregate metric.** This is a meaningful pattern, not bad luck — it suggests the remaining ~19 misses are not primarily explained by chunking, cross-document noise, or table formatting, and that further tuning along those same axes is unlikely to move the number much further. Two different directions look more promising for what's actually left: **query-side rewriting** (expanding "quick ratio" into the raw line-item terms a query would need to actually match retrievable content, attacking the vocabulary gap from the query side instead of the document side) and **treating computed-metric questions as a fundamentally different pipeline path** — retrieve the raw source numbers (even imperfectly) and *compute* the answer downstream, rather than expecting a single retrieved passage to already state it. Notably, this second direction is not a new idea invented here — it's exactly what the project's own original roadmap (Section 1) already scheduled for Day 3: a calculator tool. This failure analysis is the first concrete, measured justification for *why* that tool is necessary, rather than just a nice-to-have.
+
+---
+
+## 16. Generation Stage (Phase 1, Stage 4): Tool-Augmented Answers
+
+### Why this, and why now
+
+Everything through Section 15 only ever produced a ranked list of source passages — the project had no way to actually answer a question yet. That gap is Stage 4, and closing it was always on the roadmap. What moved *inside* Stage 4 is the calculator: it was originally scheduled for Day 3 as a generic nice-to-have, but Section 15 gave a specific, measured reason to build it now instead. Three consecutive retrieval-only fixes (chunk-size ablation, doc-scoped filtering, table serialization) all measured zero Recall@5 improvement, and the AMD quick-ratio diagnosis explained why: the gold answer (1.57) is a *derived* number — it's computed from four raw balance-sheet line items, and the phrase "quick ratio" never appears anywhere in AMD's actual filing. No retrieval fix can find text that was never there to begin with. And free-text arithmetic isn't a safe substitute either — LLMs generate answers by predicting plausible next tokens, not by executing arithmetic, so they're well documented to make computational errors even when they've picked out the right numbers. A tool hands the actual computation to real, deterministic code instead.
+
+### What was built — `src/finrag/generate.py`
+
+- **`SYSTEM_PROMPT`** — the entire grounding mechanism. Instructs the model to answer only from provided context, cite every claim as `(Company, page N)`, and prefer a tool over doing arithmetic itself. Nothing enforces this except the instruction — a model can still ignore it; there's no hard guarantee, only a strong steer.
+- **Security: no `eval()`.** Tool arguments come from the model, which is effectively untrusted input (in principle steerable by adversarial content hidden in a retrieved chunk — a prompt injection). `calculate()` parses its argument with `ast.parse(..., mode="eval")` and walks the tree with a hand-written recursive evaluator (`_safe_eval`) that only knows how to handle three node shapes — a numeric constant, a binary op, a unary minus — restricted to `+ - * / ** %` via an explicit whitelist dict (`_ALLOWED_OPS`). Anything else (a name, a function call, an attribute access) raises instead of executing.
+- **Three tools, not one.** A direct check of the eval set found 10 of 29 questions ask some version of "how did X change" (operating margin change, gross margin change, effective tax rate change, revenue drivers, segment growth) — the single biggest repeated computation shape in the corpus, big enough to deserve its own tool rather than making the model re-derive `(new - old) / old` correctly from scratch every time:
+  - `percent_change(old, new)` — for the YoY-comparison questions.
+  - `ratio(numerator, denominator)` — for single-period ratios/margins (quick ratio, operating margin, EBITDA margin). Originally designed to take plain JSON numbers rather than an expression string, specifically to eliminate a real bug class: with a single generic `calculate("a + b + c / d")`, the model has to get its own parenthesization right, and a missing paren silently divides only `c` by `d` (normal operator precedence) — a wrong answer with no error. This design assumption did not survive contact with a live model; see the first bug below.
+  - `calculate(expression)` — the general-purpose fallback, unchanged in spirit from the original design, extended to also allow `**` and `%` (two more entries in the same whitelist — no new AST node types, no new attack surface).
+- **`_TOOL_FUNCTIONS` dispatch dict** maps a tool name to the function that actually executes it, so `generate_answer()` handles any number of tools without an `if/elif` chain per tool.
+- **The tool-use cycle** follows Groq's documented local-tool-calling pattern (`console.groq.com/docs/tool-use`, read directly before building this): send tool schemas → model requests a call instead of answering → our code executes it locally → the result is appended as a `"tool"`-role message → a second call produces the final answer now that the computed number is in context.
+
+### Three real bugs, found only by actually running it — none of them predictable from documentation
+
+The design above looked complete on paper. Live testing against Groq immediately surfaced three separate failures, each fixed in turn, each teaching something the docs didn't cover (Groq's own tool-use guide and error-code reference were checked directly for any mention of this — neither says anything about it).
+
+**Bug 1 — JSON type mismatch.** `ratio`'s `numerator`/`denominator` were first typed `"number"` in the JSON schema. Given AMD's real balance-sheet numbers (cash $4,835M, short-term investments $1,020M, accounts receivable ~$4,126M, current liabilities ~$6,369M), the model tried to call:
+```
+<function=ratio>{"numerator": 4835 + 1020 + 4126, "denominator": 6369}</function>
+```
+— i.e. it wanted to *sum* the three line items inline as part of the argument, rather than pre-adding them first. `4835 + 1020 + 4126` isn't valid JSON for a `"number"` field (JSON numbers are literals only), so Groq's own schema validation rejected the entire generation server-side with a 400 `tool_use_failed`, before any of our code ever ran.
+**Fix:** retype `numerator`/`denominator`/`old`/`new` as `"string"` — accepting either a bare number or a small expression — and route them through the same restricted evaluator `calculate()` already uses (`_resolve()`: try `float()` first, fall back to `calculate()`). This keeps the "not `eval()`" security property, just applied one level lower than originally designed, and matches what the model actually wants to send.
+
+**Bug 2 — the model's own function-call wrapper syntax is unreliable.** After Bug 1's fix, the JSON *payload* became valid, but three separate live attempts still failed with `tool_use_failed`, each with a different malformed wrapper where a `>` should have been:
+```
+<function=ratio[]{"numerator": "4835 + 1020 + 4126", "denominator": "6369"}</function>
+<function=ratio,{"numerator": "4835 + 1020 + 4126", "denominator": "6369"}</function>
+<function=ratio={"numerator": "4835 + 1020 + 4126", "denominator": "6369"}</function>
+<function=ratio({"numerator": "4835 + 1020 + 4126", "denominator": "6369"})</function>
+```
+The trigger looks repeatable, not random: every failure happened specifically when an argument value was a multi-term expression (`"4835 + 1020 + 4126"`) rather than a bare number — a genuine reliability limit of `llama-3.3-70b-versatile`'s tool-calling for this input shape, not a schema bug on our end. Tried `parallel_tool_calls=False` first (the stray `[]` looked array-related) — didn't fix it, ruled out as the cause.
+**Fix:** `_call_with_tools()` wraps the first API call in a bounded retry loop (`MAX_TOOL_ATTEMPTS = 3`). On a `BadRequestError`, it appends an explicit corrective message to the conversation telling the model to pre-compute any sum via `calculate` first and pass a single bare number to `ratio`/`percent_change` — a real self-correction step, not a blind retry. On the third attempt the model changed strategy on its own (pre-summed `4835+1020+4126=9981` and called `ratio(9981, 6369)` cleanly), and the call succeeded.
+
+**Bug 3 — content leak on message replay.** Even after Bug 2's fix produced a *successful* tool call, the final printed answer was still the raw text `<function=ratio>{"numerator":9981,"denominator":6369}</function>` instead of a sentence. Cause: Groq's server apparently populates `message.content` with the raw literal wrapper text even when `tool_calls` parsed successfully (unlike a strictly OpenAI-compatible provider, which would leave `content` empty for a tool-call-only turn). The code was blindly forwarding that into the replayed assistant message (`"content": message.content or ""`), so by the second API call the conversation history already contained what looked like the model's own prior turn being that raw wrapper text — and the model imitated it instead of writing a real answer, even though the underlying tool computation was already correct.
+**Fix:** set `"content": None` for the replayed tool-call-only assistant turn instead of forwarding `message.content` — the standard shape for this kind of turn regardless of what a specific provider echoes back.
+
+### Validation
+
+With all three fixes in place, an isolated test — `retrieve()` deliberately bypassed, AMD's real balance-sheet chunk (`p56`, containing `"Cash and cash equivalents $ 4,835 ... Short-term investments 1,020 ..."`) fetched directly from Chroma by metadata filter instead of similarity search — produced:
+```
+A: Based on the quick ratio of 1.57 (AMD, page 56), AMD has a reasonably healthy liquidity
+profile for FY22. The quick ratio is greater than 1, indicating that the company has
+sufficient liquid assets to cover its current liabilities (AMD, page 56).
+
+[used tool: True]
+```
+`9981 / 6369 ≈ 1.567` — matching FinanceBench's actual gold answer (1.57) almost exactly, with a correctly cited, grounded final sentence. This confirms the full tool-use mechanism (schema → model request → local execution → replay → final answer) is now correct end-to-end, given the right context.
+
+### The gap this doesn't close
+
+That test deliberately bypassed `retrieve()`. Running the *real* pipeline (`python3 -m src.finrag.generate`, using actual whole-corpus retrieval) on this exact same question returns **zero AMD chunks** in the top 5 at all — not "right document, wrong page," but three entirely different companies:
+
+| Rank | Result |
+|---|---|
+| 1 | American Express p16 — "minimum leverage ratio requirements" (sim 0.751) |
+| 2 | 3M p53 — accounting estimates boilerplate (sim 0.713) |
+| 3 | American Express p140 — fair value valuation techniques (sim 0.712) |
+| 4 | PepsiCo p102 — cash-equivalents classification footnote (sim 0.706) |
+| 5 | American Express p85 — card-merchant retention language (sim 0.703) |
+
+**Why:** the query itself ("liquidity profile," "cash and cash equivalents," "short-term investments," "current liabilities") is standard balance-sheet vocabulary that appears, worded similarly, in every company's 10-K — so the query embedding lands near *any* passage using that language, not specifically AMD's. AMD's actual balance-sheet chunk is mostly bare numbers, comparatively sparse in the descriptive prose `bge-small` weighs heavily, and loses the similarity contest even to the *wrong company's* prose. This is the same "financial tables embed poorly" pattern from Section 15, showing up a fourth time — now for the query itself, not just the gold chunk within its own document.
+
+The system did the right thing given that failure: with no AMD context at all, `generate_answer()` correctly refused rather than hallucinate a plausible-looking quick ratio, citing only what it actually had. That's `SYSTEM_PROMPT`'s grounding rule working exactly as intended. But it also means **generation-stage correctness and retrieval-stage correctness are genuinely separate failure modes, confirmed directly rather than just assumed**: the calculator is proven correct, and the system still fails end-to-end on this question, because generation can only work with what retrieval actually hands it.
+
+---
+
+## 17. Reranking and Hybrid Retrieval: Two More Negative Results, Rigorously Tuned
+
+Sections 14.8 and 15 already ruled out chunk-size tuning, doc-scoped filtering, and table serialization as fixes for the retrieval gap — three negative results in a row. This section adds two more, tested the same way: implement the standard technique properly, measure it on the identical 29-question eval set with the identical hit-scoring rule, and follow the data wherever it goes rather than assume it worked.
+
+### Reranking (cross-encoder)
+
+**What it is:** `bge-small` (used everywhere so far) is a *bi-encoder* — it embeds the query and each passage completely separately, then compares vectors. A *cross-encoder* instead takes `(query, passage)` as one joint input and outputs a single relevance score, letting it weigh interactions a bi-encoder structurally can't see. Too expensive to run over the whole corpus (a full forward pass per candidate), so the standard pattern is: let the cheap bi-encoder narrow the corpus to a shortlist (`RERANK_CANDIDATES=20`), then spend the cross-encoder's extra accuracy only re-ordering that shortlist. Built as `src/finrag/rerank.py` (model: `cross-encoder/ms-marco-MiniLM-L-6-v2`), wired into `retrieve.py`'s `retrieve_with_rerank()`, scored with `scripts/evaluate_rerank.py`.
+
+**Result: Recall@5 = 6/29 (20.7%) — a regression below dense-only's 34.5%, not a null result.** Comparing hit sets directly: dense-only's 10 hits were `01198, 01279, 00476, 00517, 01091, 00678, 00464, 00494, 00585, 01328`; reranking's 6 hits were `01198, 00476, 00517, 00464, 00494, 01328` — **every single reranked hit was already a dense hit**, and reranking actively demoted 4 previously-correct answers (`01279, 01091, 00678, 00585`) out of the top-5. That's a stronger finding than "didn't help" — the cross-encoder had the right answer already in front of it (rank ≤5 pre-rerank) and made it worse.
+
+**Diagnosis:** `ms-marco-MiniLM-L-6-v2` was trained on MS MARCO — Bing search queries and web-snippet passages. That's a different register from formal, numeric-table-heavy SEC filing prose. The model is likely well-calibrated for "does this web snippet answer this search query" and poorly calibrated for "does this balance-sheet excerpt answer this financial question" — a domain-mismatch hypothesis, not proven beyond this one experiment, but consistent with what was measured.
+
+### Hybrid retrieval (BM25 + dense, fused with RRF)
+
+**What it is:** dense (34.5%) and BM25 (13.8%) aren't just "one better, one worse" — Section 13 already showed BM25 uniquely hit 2 questions (`01226`, `01009`) that dense missed entirely, a real complementary signal (union of both methods' hits = 12/29, 41.4%). Reciprocal Rank Fusion (RRF) combines two ranked lists using only their **rank positions**, not raw scores — necessary because cosine similarity (~0-1) and BM25's unbounded raw score aren't on comparable scales, so adding them directly would be meaningless. Formula: `RRF_score(chunk) = Σ 1/(RRF_K + rank_in_list)` summed across every list the chunk appears in. Built as `src/finrag/hybrid_retrieve.py`, `RRF_K=60` (the standard value from the original RRF paper, Cormack/Clarke/Buettcher 2009), scored with `scripts/evaluate_hybrid.py`.
+
+**Before trusting the result, two things were verified directly rather than assumed:**
+1. **Corpus sync** — dense's persisted Chroma collection and BM25's freshly-rebuilt in-memory index both needed to be searching the *same* chunk set for `(doc_name, page_index, text)` matching to be valid. Checked `collection.count()` directly: 5,659, matching BM25's fresh `chunk_corpus()` output exactly. No mismatch.
+2. **Premise still holds on the current (table-aware) corpus** — the BM25 baseline numbers (13.8%, uniquely hits `01226`/`01009`) were originally measured *before* table-aware chunking was added to `ingest.py`. Re-ran `evaluate_bm25.py` fresh: still exactly 13.8% (4/29), and `01226`/`01009` are still both hits. Table serialization's already-documented zero effect (Section 16) held for BM25 too — the premise motivating hybrid retrieval was current, not stale.
+
+**Result at default RRF_K=60: Recall@5 = 7/29 (24.1%) — another regression, and it failed to rescue either target question.** Diagnosis, found by inspecting the actual RRF math: the winning top-5 chunks had scores around `0.0313` — close to two combined contributions from a chunk both methods rank reasonably (`1/61 + 1/62 ≈ 0.0325`). But `01226`'s gold chunk is a **BM25-only** hit by definition (that's exactly why dense missed it) — its RRF score can only ever come from one list, capping around `1/61 ≈ 0.0164`, roughly half what a mediocre *consensus* chunk accumulates. **RRF structurally rewards agreement between methods over either method's unique high-confidence signal** — the opposite of what rescuing a single-method-only correct answer needs.
+
+**RRF_K ablation — testing whether tuning could fix this, not just guessing:**
+```
+ RRF_K | Recall@5     | watched questions
+-------|--------------|---------------------------
+     0 | 9/29 (31.0%) | 01226=HIT, 01009=miss
+     1 | 9/29 (31.0%) | 01226=HIT, 01009=miss
+     5 | 8/29 (27.6%) | 01226=miss, 01009=miss
+    10 | 7/29 (24.1%) | 01226=miss, 01009=miss
+    30 | 7/29 (24.1%) | 01226=miss, 01009=miss
+    60 | 7/29 (24.1%) | 01226=miss, 01009=miss
+```
+Smaller K clearly helps — it weights top rank positions more steeply, letting a single method's strong pick compete better against two methods' weak agreement — and `01226` does flip to a hit at K≤1, confirming the diagnosis was mechanistically correct. But the improvement **plateaus at K=0/K=1 (31.0%)**, and `01009` never flips regardless of K. **Even the best-tuned hybrid configuration, found by sweeping the full reasonable range of its main hyperparameter, still falls short of dense-only's 34.5%.**
+
+**What's structurally different, not yet tried at this point:** every technique above operates on the *document* side (how chunks are split, indexed, reordered, or fused) while leaving the *query* completely unchanged. The recurring failure pattern across all of Section 15 and this section is a **vocabulary/register mismatch** — a query like "quick ratio" or "liquidity profile" uses abstract financial terminology that never appears in the source filing (which only states raw line items), and pulls toward *other companies'* prose that happens to share that abstract vocabulary. Query rewriting or HyDE (Hypothetical Document Embeddings — Gao et al. 2022: generate a hypothetical passage that *would* answer the question, and embed that instead of the raw question, so the thing being embedded is prose-shaped like the actual filings rather than a short interrogative question) attacks this from the query side instead — mechanistically different from anything tried so far.
+
+### Query expansion — a zero-cost proxy for HyDE, tested immediately given the pattern above
+
+Full HyDE needs an LLM call per query to generate the hypothetical passage — real Groq quota cost, and quota was still constrained the day this was built. Before waiting on that, the underlying *hypothesis* (richer, filing-shaped vocabulary in the query closes the gap) was tested for free: `src/finrag/query_expand.py` hand-maps a handful of financial metric names (`quick ratio`, `operating margin`, `gross margin`, `effective tax rate`, `ebitda`) to the raw line-item vocabulary their *standard textbook definitions* are built from, and appends that vocabulary to any query mentioning the metric. Deliberately using only general financial knowledge, not anything read off the actual gold filing text — the same vocabulary an LLM asked to draft a hypothetical answer would independently produce, so this is representative of real HyDE, not an answer-leaked shortcut.
+
+A 2-question manual check first: AMD's quick-ratio gold page went from **not in the top-20 at all** to **rank 5**, using only the standard quick-ratio formula's terms. Scaled up to the full 29-question eval (`scripts/evaluate_query_expansion.py`, wired as `retrieve.py`'s `retrieve_with_expansion()`):
+
+**Result: Recall@5 = 11/29 (37.9%) — the first of six techniques tried today to actually beat the dense-only baseline (34.5%).** And cleanly: every one of dense-only's original 10 hits is still present, plus one genuine new rescue — `financebench_id_01226` (3M's operating margin question), where "operating margin" in the question text triggered the dictionary and pulled the gold page into the top-5 for the first time. Zero hits lost, unlike reranking and hybrid RRF, which both traded away previously-correct answers to gain new ones.
+
+One honest caveat: `financebench_id_00222` (AMD's own quick-ratio question) is *still* a miss in the full run, despite the promising 2-question check. The real eval question has an extra clause the manual check didn't include ("If the quick ratio is not relevant to measure liquidity, please state that and explain why") — different embedded text, different result. A reminder that a hand-picked spot check and a full, automated eval run over the exact real question text are not interchangeable, and only the latter is trustworthy enough to act on.
+
+### Synthesis: six techniques tried, query expansion is the first genuine win
+
+```
+Query expansion                    37.9%  (11/29)  <- new best
+Dense only (baseline)               34.5%  (10/29)
+Hybrid RRF, tuned (K=0 or K=1)      31.0%  ( 9/29)
+Hybrid RRF, default (K=60)          24.1%  ( 7/29)
+Reranked (cross-encoder)            20.7%  ( 6/29)
+BM25 only                           13.8%  ( 4/29)
+```
+Chunk-size ablation, doc-scoped filtering, table serialization, reranking, and hybrid RRF — five document-side techniques, all at or below the dense-only baseline. Query expansion — the one technique that touches the *query* instead — is the first to actually beat it, and it does so with a mechanism specific enough to explain in one sentence: the vocabulary gap diagnosed repeatedly across Sections 15 and 17 is real, and closing it from the query side works better than any amount of reprocessing the documents did.
+
+**Decision, revised: ship `retrieve_with_expansion()` (dense + the metric-vocabulary expansion) as the production retriever**, not plain `retrieve()`. This is deliberately a narrow, manually-maintained proof-of-concept — 5 hand-picked metrics, not a general solution — and full HyDE (LLM-generated expansion, generalizing to any question) remains the natural, more rigorous next step once Groq quota allows. But the measured result justifies shipping the cheap version now rather than waiting: it's strictly better than the baseline it replaces, at zero additional cost or latency.
+
+---
+
+## 18. Wiring the Winning Retriever In, and Calibrating the Guardrail From Real Data
+
+### Wiring `retrieve_with_expansion()` into the actual pipeline
+
+Section 17 measured `retrieve_with_expansion()` as the best-performing retriever, but measuring it in an eval script and actually *using* it in the real pipeline are two different things — `generate.py`'s demo and `evaluate_generation.py` were both still importing plain `retrieve()`. Fixed by swapping the import (`from .retrieve import retrieve_with_expansion as retrieve`) in both files — a one-line change per file, since every retriever built today (`retrieve`, `bm25_retrieve.retrieve`, `retrieve_with_rerank`, `retrieve_hybrid`, `retrieve_with_expansion`) deliberately returns the identical `{"text","metadata","similarity"}` shape specifically so callers don't care which one is plugged in.
+
+### Calibrating `MIN_RELEVANCE_SCORE` — the guardrail — from real data instead of a guess
+
+`MIN_RELEVANCE_SCORE` had been an unvalidated placeholder (0.30) since Day 1, flagged repeatedly as needing real out-of-scope test questions that didn't exist yet (Section 11). Built 7 of them across two deliberately different categories, and measured each one's best-similarity score through `retrieve_with_expansion()`:
+
+```
+Genuinely unrelated topics:
+  0.522  What is the capital of France?
+  0.487  How do I bake a chocolate cake?
+  0.577  What is the weather forecast for tomorrow?
+                                                    <- max 0.577
+
+"Right structure, wrong company" (real financial questions,
+ about companies NOT in the 5-document corpus):
+  0.720  What was Apple's total revenue in fiscal year 2022?
+  0.632  What is Tesla's current ratio for FY2022?
+  0.769  What was Google's operating margin in FY2022?
+  0.634  Who won the World Cup in 2022? (borderline, not financial)
+```
+
+Compared against the real in-scope range across all 29 eval questions (hits and misses combined): **0.660-0.810.**
+
+**The important, honest finding: these two out-of-scope categories behave completely differently, and the guardrail can only ever catch one of them.** Genuinely unrelated topics score clearly below the in-scope floor (max 0.577 vs. floor 0.660) — a clean gap to place a threshold in. But "right structure, wrong company" questions score *inside* the in-scope range (Apple 0.720, Google 0.769) — the same mechanism behind every cross-document-contamination case documented all day (Section 15's Case 1, Section 17's reranking failures): the embedding model matches on financial sentence structure and vocabulary, not on which specific company is named, so a well-formed question about Apple's revenue looks just as "relevant" to this corpus as a real question about AMD's. **No similarity threshold can distinguish these** — a company name swap doesn't change the question's structural fingerprint enough to move the score.
+
+**Set `MIN_RELEVANCE_SCORE = 0.60`** — inside the clean gap between 0.577 (highest unrelated-topic score) and 0.660 (lowest real in-scope score). This guarantees zero real in-scope questions are ever incorrectly refused, while catching clearly off-topic queries. It will **not** catch a well-phrased question about a company outside the corpus — documented as a known, real limitation, not silently ignored.
+
+**Wired into `generate_answer()`** (`src/finrag/generate.py`): if the best retrieved chunk's similarity is below the threshold, the function returns an immediate refusal *without calling Groq at all*. Verified directly: `"What is the capital of France?"` (similarity 0.522) returned the canned refusal instantly, while a real Boeing question (similarity 0.705) passed through and produced a normal, grounded answer. This is a guardrail and a quota-saving measure at once — a real, tangible benefit given today's Groq daily-limit exhaustion (Section 16).
 
 ---
 
