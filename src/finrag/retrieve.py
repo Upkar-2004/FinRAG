@@ -88,6 +88,32 @@ def retrieve(question: str, k: int = config.TOP_K) -> list[dict]:
     return hits
 
 
+def retrieve_with_rerank(question: str, k: int = config.TOP_K) -> list[dict]:
+    """Same shape and contract as retrieve() -- {"text","metadata","similarity"}
+    per result -- but widens the dense search to config.RERANK_CANDIDATES
+    first, then has rerank.py's cross-encoder narrow it back down to k.
+    Matches the "functions as values" pattern already used for BM25: this
+    can be passed straight into evaluate_retrieval.py's evaluate(retrieve_fn=...)
+    to score it with the identical harness and hit-scoring rule.
+    """
+    from .rerank import rerank  # local import: avoid loading the cross-encoder for callers that only need plain retrieve()
+
+    candidates = retrieve(question, k=config.RERANK_CANDIDATES)
+    return rerank(question, candidates, k=k)
+
+
+def retrieve_with_expansion(question: str, k: int = config.TOP_K) -> list[dict]:
+    """Same shape/contract as retrieve() -- expands the query with
+    query_expand.expand_query() first (see that module's docstring for
+    why), then searches normally. Matches the "functions as values"
+    pattern already used for BM25/reranked/hybrid retrieval: drops
+    straight into evaluate_retrieval.py's evaluate(retrieve_fn=...).
+    """
+    from .query_expand import expand_query
+
+    return retrieve(expand_query(question), k=k)
+
+
 if __name__ == "__main__":
     question = "What are the major products and services that AMD sells as of FY22?"
     print(f"Question: {question}\n")
