@@ -53,6 +53,7 @@ Rules:
 - If the context does not contain enough information to answer, say so explicitly instead of guessing.
 - Every claim must be followed by a citation in the form (Company, page N), using the page numbers given in the context.
 - If the question requires a computed value, use the most specific tool available: `percent_change` for any year-over-year or "how did X change" question, `ratio` for a single-period ratio or margin (quick ratio, operating margin, EBITDA margin), or `calculate` for anything else. Never do arithmetic yourself -- you are not reliable at it, the tools are.
+- If the context does NOT contain the actual numeric values a computation needs, do not call a tool at all. State plainly that you don't have enough information. Never pass a description or label (e.g. "cash + short-term investments") as a tool argument -- only real numbers taken from the context.
 """
 
 # OpenAI-compatible function-calling schemas. Groq's chat completions API
@@ -235,7 +236,7 @@ def _format_context(chunks: list[dict]) -> str:
 MAX_TOOL_ATTEMPTS = 3
 
 
-def _call_with_tools(messages: list[dict]):
+def _call_with_tools(messages: list[dict]): #Self-correction loop for tool calls
     """First API call, with tools enabled -- retried on malformed tool-call
     generations.
 
@@ -291,7 +292,26 @@ def generate_answer(question: str, chunks: list[dict]) -> dict:
     locally via _TOOL_FUNCTIONS, feed the results back as "tool" messages,
     and ask again for the final answer now that the computed numbers are
     in context.
+
+    Guardrail: if the best chunk's similarity is below
+    config.MIN_RELEVANCE_SCORE, refuses without calling the LLM at all --
+    both a correctness guardrail (catches clearly out-of-scope queries)
+    and a quota-saving one (no wasted API call on a doomed question). See
+    config.py for how the threshold was calibrated, and its documented
+    limitation (can't catch "right structure, wrong company" queries).
+    Assumes `chunks` came from a cosine-similarity retriever (retrieve()
+    or retrieve_with_expansion()) -- BM25/hybrid/reranked scores are on
+    different scales and would make this comparison meaningless.
     """
+    if not chunks or max(c["similarity"] for c in chunks) < config.MIN_RELEVANCE_SCORE:
+        return {
+            "answer": (
+                "I don't have enough relevant information in these filings to answer "
+                "that question. It may be outside the scope of the documents available."
+            ),
+            "used_tool": False,
+        }
+
     context = _format_context(chunks)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -341,7 +361,7 @@ def generate_answer(question: str, chunks: list[dict]) -> dict:
 
 
 if __name__ == "__main__":
-    from .retrieve import retrieve
+    from .retrieve import retrieve_with_expansion as retrieve
 
     question = (
         "Does AMD have a reasonably healthy liquidity profile based on its quick ratio for FY22? "
