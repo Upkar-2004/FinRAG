@@ -43,6 +43,8 @@ from groq import BadRequestError, Groq
 
 import config
 
+from . import telemetry
+
 load_dotenv()
 _client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
@@ -330,6 +332,14 @@ def generate_answer(question: str, chunks: list[dict]) -> dict:
     different scales and would make this comparison meaningless.
     """
     if not chunks or max(c["similarity"] for c in chunks) < config.MIN_RELEVANCE_SCORE:
+        # Guardrail fired -- no Groq call happens at all, so there's no
+        # latency or token cost to measure. Still worth a telemetry record:
+        # it's the only way to later quantify how often the guardrail is
+        # actually saving quota (Section 18 calls this "a quota-saving
+        # measure" -- this is what would let you prove that claim with a
+        # number instead of asserting it).
+        with telemetry.timed("generation", question=question, refused=True):
+            pass
         return {
             "answer": (
                 "I don't have enough relevant information in these filings to answer "
@@ -345,52 +355,76 @@ def generate_answer(question: str, chunks: list[dict]) -> dict:
     ]
 
     used_tool = False
-    for _ in range(MAX_TOOL_ROUNDS):
-        response = _call_with_tools(messages)
-        message = response.choices[0].message
+    prompt_tokens = 0
+    completion_tokens = 0
+    rounds = 0
 
-        if not message.tool_calls:
-            return {"answer": message.content, "used_tool": used_tool}
+    with telemetry.timed("generation", question=question, refused=False) as rec:
+        for _ in range(MAX_TOOL_ROUNDS):
+            response = _call_with_tools(messages)
+            rounds += 1
+            # response.usage is per-CALL, not cumulative across the
+            # conversation -- each round resends the whole growing message
+            # list as new prompt tokens, so a 3-round tool-use exchange is
+            # 3 separate billed calls, not 1. Sum them for a true total.
+            if response.usage is not None:
+                prompt_tokens += response.usage.prompt_tokens
+                completion_tokens += response.usage.completion_tokens
+            message = response.choices[0].message
 
-        used_tool = True
-        messages.append(
-            {
-                # NOT message.content -- Groq's server sometimes echoes the
-                # raw "<function=...>" wrapper text into content even when
-                # tool_calls parsed successfully (empirically observed; see
-                # _call_with_tools docstring for the related wrapper-parsing
-                # issue). Forwarding that raw text here got imitated by the
-                # model on the next turn instead of a real answer -- the
-                # tool call itself was correct, only the replayed text was
-                # polluted. content=None is the standard shape for a
-                # tool-call-only assistant turn anyway.
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in message.tool_calls
-                ],
-            }
-        )
-        for tc in message.tool_calls:
-            args = json.loads(tc.function.arguments)
-            try:
-                result = _TOOL_FUNCTIONS[tc.function.name](args)
-            except Exception as e:
-                result = f"Error: {e}"
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)})
+            if not message.tool_calls:
+                rec["rounds"] = rounds
+                rec["used_tool"] = used_tool
+                rec["prompt_tokens"] = prompt_tokens
+                rec["completion_tokens"] = completion_tokens
+                rec["estimated_cost_usd"] = telemetry.estimate_cost_usd(prompt_tokens, completion_tokens)
+                return {"answer": message.content, "used_tool": used_tool}
 
-    return {
-        "answer": (
-            "I wasn't able to finish this calculation after several steps. "
-            "Please try rephrasing the question or breaking it into simpler parts."
-        ),
-        "used_tool": used_tool,
-    }
+            used_tool = True
+            messages.append(
+                {
+                    # NOT message.content -- Groq's server sometimes echoes the
+                    # raw "<function=...>" wrapper text into content even when
+                    # tool_calls parsed successfully (empirically observed; see
+                    # _call_with_tools docstring for the related wrapper-parsing
+                    # issue). Forwarding that raw text here got imitated by the
+                    # model on the next turn instead of a real answer -- the
+                    # tool call itself was correct, only the replayed text was
+                    # polluted. content=None is the standard shape for a
+                    # tool-call-only assistant turn anyway.
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                        }
+                        for tc in message.tool_calls
+                    ],
+                }
+            )
+            for tc in message.tool_calls:
+                args = json.loads(tc.function.arguments)
+                try:
+                    result = _TOOL_FUNCTIONS[tc.function.name](args)
+                except Exception as e:
+                    result = f"Error: {e}"
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)})
+
+        rec["rounds"] = rounds
+        rec["used_tool"] = used_tool
+        rec["prompt_tokens"] = prompt_tokens
+        rec["completion_tokens"] = completion_tokens
+        rec["estimated_cost_usd"] = telemetry.estimate_cost_usd(prompt_tokens, completion_tokens)
+        rec["exhausted_rounds"] = True
+        return {
+            "answer": (
+                "I wasn't able to finish this calculation after several steps. "
+                "Please try rephrasing the question or breaking it into simpler parts."
+            ),
+            "used_tool": used_tool,
+        }
 
 
 if __name__ == "__main__":

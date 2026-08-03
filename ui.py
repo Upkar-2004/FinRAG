@@ -66,7 +66,7 @@ body, [data-testid="stAppViewContainer"] { overflow-x: hidden; }
    brass/black wash is the real element's OWN background (paints behind
    both position:absolute pseudo-elements by default stacking rules), not a
    third pseudo-element CSS can't give us. Image URLs are injected per-run
-   via a small scoped <style> block -- see render_atmosphere(). */
+   via a small scoped stylesheet call -- see render_atmosphere(). */
 [data-testid="stMain"] {
   position: relative;
   overflow: hidden;
@@ -118,7 +118,13 @@ body, [data-testid="stAppViewContainer"] { overflow-x: hidden; }
 }
 
 /* ---- sidebar / brand rail ------------------------------------------- */
-[data-testid="stSidebar"] { min-width: 340px !important; max-width: 390px !important; }
+/* Only forced on desktop -- on narrow viewports this fought Streamlit's own
+   sidebar-collapse mechanism, forcing a 340px-wide sidebar into a ~390px
+   screen instead of letting it hide. Confirmed visually: without this
+   guard, mobile showed both sidebar and main content crushed into slivers. */
+@media (min-width: 641px) {
+  [data-testid="stSidebar"] { min-width: 340px !important; max-width: 390px !important; }
+}
 [data-testid="stSidebar"] [data-testid="stSidebarContent"] { padding-top: 28px; }
 .finrag-wordmark {
   font-family: var(--serif);

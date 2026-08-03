@@ -30,6 +30,7 @@ from groq import BadRequestError, RateLimitError
 
 import config
 import ui
+from src.finrag import telemetry
 from src.finrag.generate import generate_answer
 from src.finrag.retrieve import retrieve_with_expansion
 
@@ -88,7 +89,9 @@ display_scope = st.session_state.last_scope
 if submitted:
     if question and question.strip():
         with st.spinner("Retrieving relevant filing text...", show_time=True):
-            chunks = retrieve_with_expansion(question, k=config.TOP_K, doc_names=doc_names)
+            with telemetry.timed("retrieval", question=question, doc_names=doc_names) as rec:
+                chunks = retrieve_with_expansion(question, k=config.TOP_K, doc_names=doc_names)
+                rec["num_results"] = len(chunks)
         with st.spinner("Generating grounded answer...", show_time=True):
             try:
                 result = generate_answer(question, chunks)

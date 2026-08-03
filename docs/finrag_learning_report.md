@@ -24,6 +24,7 @@
 16. [Generation Stage (Phase 1, Stage 4): Tool-Augmented Answers](#16-generation-stage-phase-1-stage-4-tool-augmented-answers)
 17. [Reranking and Hybrid Retrieval: Two More Negative Results, Rigorously Tuned](#17-reranking-and-hybrid-retrieval-two-more-negative-results-rigorously-tuned)
 18. [Wiring the Winning Retriever In, and Calibrating the Guardrail From Real Data](#18-wiring-the-winning-retriever-in-and-calibrating-the-guardrail-from-real-data)
+19. [Streamlit UI: A Cinematic Redesign and the Verification-Layer Bug](#19-streamlit-ui-a-cinematic-redesign-and-the-verification-layer-bug)
 
 ---
 
@@ -1184,6 +1185,157 @@ Compared against the real in-scope range across all 29 eval questions (hits and 
 **Set `MIN_RELEVANCE_SCORE = 0.60`** — inside the clean gap between 0.577 (highest unrelated-topic score) and 0.660 (lowest real in-scope score). This guarantees zero real in-scope questions are ever incorrectly refused, while catching clearly off-topic queries. It will **not** catch a well-phrased question about a company outside the corpus — documented as a known, real limitation, not silently ignored.
 
 **Wired into `generate_answer()`** (`src/finrag/generate.py`): if the best retrieved chunk's similarity is below the threshold, the function returns an immediate refusal *without calling Groq at all*. Verified directly: `"What is the capital of France?"` (similarity 0.522) returned the canned refusal instantly, while a real Boeing question (similarity 0.705) passed through and produced a normal, grounded answer. This is a guardrail and a quota-saving measure at once — a real, tangible benefit given today's Groq daily-limit exhaustion (Section 16).
+
+---
+
+## 19. Streamlit UI: A Cinematic Redesign and the Verification-Layer Bug
+
+### Why this, and why now
+
+Every stage through Section 18 produced a correct pipeline reachable only
+through a Python REPL or a bare-default Streamlit page — functionally
+complete, not portfolio-presentable. Section 11's roadmap had always
+flagged a demo UI as the Day 3 deliverable. What made it non-trivial was
+the specific brief: not "make it look nicer" but a fully specified
+"cinematic Wall Street terminal" design — dark obsidian background,
+layered financial photography, a large brass-accented wordmark, custom
+typography, translucent citation cards — implemented on top of Streamlit,
+which is not designed for this level of visual control and pushes anyone
+attempting it straight into `st.html()` and raw CSS injection.
+
+### What was built — `ui.py`, `app.py`, `.streamlit/config.toml`
+
+Layered, in increasing order of how far outside Streamlit's native styling
+surface each one reaches:
+
+- **`.streamlit/config.toml`** — the obsidian/brass color palette
+  (`backgroundColor`, `primaryColor`, `headingFont` via a Google Fonts
+  URL) using Streamlit's own theming system. This layer is fully native —
+  no injection, no risk of the bugs below.
+- **`ui.py`'s `THEME_CSS`** — a large CSS string handling everything
+  `config.toml` has no slot for: layered `::before`/`::after` background
+  photography on the main content area, translucent blurred surfaces for
+  the answer card, citation badges, evidence-card `:target` highlighting,
+  and responsive breakpoints. Injected via `st.html()`, which is where all
+  three bugs below live.
+- **`app.py`** — layout only: a persistent photographic atmosphere behind
+  the composer, the FinRAG wordmark as the sidebar's hero element instead
+  of a separate in-page headline, and a two-column
+  `[answer document | evidence panel]` split that only appears once an
+  answer exists.
+
+### Bug 1 — `st.html()` strips `<style>` tags by default
+
+First attempt: `st.html(f"<style>{THEME_CSS}</style>")`. Nothing rendered
+— no error, no exception, just silently absent styling, which is the
+worst kind of bug to debug because there's no stack trace to start from.
+Traced by reading Streamlit's frontend source directly
+(`Html.BuYM1o_2.js` in the installed package) rather than guessing:
+`st.html()` sanitizes its input client-side with DOMPurify, and the
+default `USE_PROFILES: {html: true}` profile **excludes `<style>` and
+`<script>` tags entirely** — they're only added back
+(`ADD_TAGS: ['script', 'style']`) when the call passes
+`unsafe_allow_javascript=True`.
+
+**Fix:** `st.html(f"<style>{THEME_CSS}</style>", unsafe_allow_javascript=True)`.
+This alone looked like the fix. It wasn't — see Bug 2.
+
+### Bug 2 — the flag above doesn't always reach the sanitizer
+
+Same failure, same silent no-op, even with the flag set. This one had no
+JS-side explanation — the fix from Bug 1 was correct in principle — so
+the search moved to Streamlit's **Python-side** source instead
+(`elements/html.py`). It contains a special case,
+`_html_only_style_tags()`, that detects when an `st.html()` call's body
+is *purely* a `<style>` tag (after stripping comments) and routes it
+through a different internal delta-generator path
+(`self._event_dg._enqueue(...)`) — one that **never sets
+`html_proto.unsafe_allow_javascript` at all**, regardless of what the
+caller passed. The flag was being silently dropped before it ever reached
+the frontend.
+
+**Fix:** append content that isn't pure style to the payload, so the
+call takes the normal code path instead of the special-cased one:
+
+```python
+st.html(f"<style>{THEME_CSS}</style><span style=\"display:none\"></span>",
+        unsafe_allow_javascript=True)
+```
+
+Verified this was actually the mechanism (not another guess) by
+monkey-patching `DeltaGenerator._enqueue` to intercept the outgoing
+protobuf message directly and confirming `unsafe_allow_javascript=True`
+was present on the wire for both `inject_theme_css()` and
+`render_atmosphere()` calls.
+
+### Bug 3 — a `<style>` tag hiding inside its own content
+
+Even after Bugs 1 and 2 were fixed, real browser inspection (see
+"The verification-layer gap," below) showed one of the two `st.html()`
+elements had been truncated down to just the hidden marker span — its CSS
+was gone, while the other call's CSS survived intact. Both calls used the
+identical fix from Bug 2, so the difference had to be in the *content*.
+Grepping `THEME_CSS` for the literal substring `<style` found it: a code
+comment inside the CSS itself, in English prose, read
+`"...via a small scoped <style> block -- see render_atmosphere(). */"`.
+Harmless as a comment on its own — but once the entire block is wrapped in
+a real `<style>` tag for injection, that substring reads to the sanitizer
+as a second, nested `<style>` opening tag, and it truncated the block at
+that point.
+
+**Fix:** reworded the comment to remove the literal substring
+(`"...via a small scoped stylesheet call..."`). The general lesson —
+worth carrying to any templating or injection context, not just this
+one — is to never let a substring matching your own delimiter appear
+inside content that delimiter bounds.
+
+### Bug 4 — a responsive rule with no responsive condition
+
+Found afterward, once the desktop view was confirmed correct: on a real
+390×844 mobile screenshot, the sidebar and main content were both crushed
+into unusable slivers. Cause: `THEME_CSS` set
+`[data-testid="stSidebar"] { min-width: 340px !important; max-width: 390px !important; }`
+unconditionally, fighting Streamlit's native sidebar-collapse behavior on
+narrow viewports instead of yielding to it.
+
+**Fix:** scope the rule to desktop only —
+`@media (min-width: 641px) { [data-testid="stSidebar"] { ... } }` —
+confirmed by a second mobile screenshot showing the sidebar correctly
+collapsed with no horizontal overflow.
+
+### The verification-layer gap — the actual lesson of this section
+
+The most expensive part of this saga wasn't any single bug — it was
+declaring the fix done, three separate times, based on evidence that
+could never have shown the bug in the first place. Each "fixed it" claim
+was checked with `AppTest` (Streamlit's Python-side test harness) or by
+inspecting the outgoing protobuf message directly — both of which confirm
+what the *server* sent. Neither can see what the *browser's* JavaScript
+sanitizer does with that message after it arrives, which is exactly where
+Bugs 1–3 all lived. Three rounds of confident-but-wrong "it's fixed"
+claims followed, each caught by the user pointing at an actual screenshot
+that didn't match.
+
+The fix wasn't a better assertion — it was adding a layer of verification
+that could see the thing that was actually broken. Installed Playwright
+(`npx playwright install chromium --with-deps`, no persistent package
+install needed) to drive a real headless Chromium browser: real
+screenshots, and real `getComputedStyle()` reads, which is the only way
+to get ground truth on what a browser actually rendered. The before/after
+comparison this produced for the wordmark element was concrete enough to
+trust: **before** the fixes — `font-size: 15px`, `font-family: Inter`,
+`position: static`, pseudo-element `content: none` (i.e. absent) —
+**after** — `font-size: 72px`, `font-family: Fraunces`,
+`position: relative`, `content: ""`, `opacity: 0.38`, correct computed
+dimensions. That diff, not a passing assertion, is what closed the loop.
+
+**Generalizable lesson:** whenever a client (a browser, a mobile app, any
+process that receives output and does its own further processing on it)
+sits between "the server sent the right thing" and "the user sees the
+right thing," testing only the server side verifies the send, not the
+receipt. The gap between those two is exactly where client-side
+sanitization, rendering, and parsing bugs live — and no amount of
+server-side test coverage will ever catch them.
 
 ---
 
