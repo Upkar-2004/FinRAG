@@ -281,17 +281,43 @@ def _call_with_tools(messages: list[dict]): #Self-correction loop for tool calls
     raise last_error
 
 
+MAX_TOOL_ROUNDS = 6
+# Was 4; raised after live traces showed that was too tight. Root cause:
+# _call_with_tools' own malformed-<function=...>-wrapper recovery (see its
+# docstring) sometimes only resolves on internal retry attempt 2 or 3, and
+# its corrective message explicitly tells the model to DECOMPOSE the
+# calculation (compute a sum with `calculate` first, THEN pass the single
+# result to `ratio`) -- turning a 1-call ratio(expr, expr) into a 3-4 call
+# chain (calculate numerator, calculate denominator, ratio, final text),
+# right after a round was already spent recovering. Reproduced live on the
+# AMD quick-ratio question across 6 identical trials: a clean run finished
+# in 3 rounds, but a run that hit the wrapper bug needed 5 -- the old
+# MAX_TOOL_ROUNDS=4 cut it off one round early, degrading to the "couldn't
+# finish" message even though the model would have reached a real answer
+# immediately after. 6 leaves headroom for that worst case plus one
+# redundant self-check call (also observed live) without letting a truly
+# stuck model loop forever.
+
+
 def generate_answer(question: str, chunks: list[dict]) -> dict:
     """Answer `question` grounded only in `chunks`, dispatching to whichever
     tool(s) the model requests for any computation. Returns
     {"answer": str, "used_tool": bool}.
 
-    Two round-trips when a tool is used: the first call gets back one or
-    more tool_call requests instead of an answer (the model can't both
-    call a tool AND answer in the same turn); we execute each tool call
-    locally via _TOOL_FUNCTIONS, feed the results back as "tool" messages,
-    and ask again for the final answer now that the computed numbers are
-    in context.
+    Loops -- not a fixed two-step sequence -- because some questions need
+    MULTIPLE separate tool calls before a final answer (e.g. a ratio needs
+    the numerator summed, then the denominator summed, then divided: three
+    calls, not one). An earlier fixed-two-round version offered tools only
+    on the FIRST call, then made a second, tool-less call expecting a final
+    answer -- but if the model still wanted another tool call at that point,
+    it had no way to make one, and it just wrote the tool-call syntax out as
+    literal text instead (a real, observed failure: "<function=calculate>
+    {...}</function>" leaking straight into the user-facing answer). Now
+    every round offers tools via _call_with_tools(), and the loop keeps
+    executing tool_calls and re-asking until the model returns a response
+    with no tool_calls at all -- a genuine final answer. Bounded by
+    MAX_TOOL_ROUNDS so a model stuck in a tool-call loop degrades to an
+    honest message instead of hanging.
 
     Guardrail: if the best chunk's similarity is below
     config.MIN_RELEVANCE_SCORE, refuses without calling the LLM at all --
@@ -318,11 +344,15 @@ def generate_answer(question: str, chunks: list[dict]) -> dict:
         {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
     ]
 
-    response = _call_with_tools(messages)
-    message = response.choices[0].message
-    used_tool = bool(message.tool_calls)
+    used_tool = False
+    for _ in range(MAX_TOOL_ROUNDS):
+        response = _call_with_tools(messages)
+        message = response.choices[0].message
 
-    if used_tool:
+        if not message.tool_calls:
+            return {"answer": message.content, "used_tool": used_tool}
+
+        used_tool = True
         messages.append(
             {
                 # NOT message.content -- Groq's server sometimes echoes the
@@ -354,10 +384,13 @@ def generate_answer(question: str, chunks: list[dict]) -> dict:
                 result = f"Error: {e}"
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)})
 
-        response = _client.chat.completions.create(model=config.GROQ_MODEL, messages=messages)
-        message = response.choices[0].message
-
-    return {"answer": message.content, "used_tool": used_tool}
+    return {
+        "answer": (
+            "I wasn't able to finish this calculation after several steps. "
+            "Please try rephrasing the question or breaking it into simpler parts."
+        ),
+        "used_tool": used_tool,
+    }
 
 
 if __name__ == "__main__":

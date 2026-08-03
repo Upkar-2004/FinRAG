@@ -1,0 +1,42 @@
+[theme]
+base = "dark"
+
+# Obsidian, not flat black -- backgroundColor is the page root, secondaryBackgroundColor
+# is used natively for the sidebar and widget fills (inputs, selects). The atmospheric
+# photography lives in a translucent layer ABOVE this in ui.py's THEME_CSS, scoped to
+# [data-testid="stMain"] only (excludes the sidebar, which stays solid/opaque per spec).
+backgroundColor = "#060708"
+secondaryBackgroundColor = "#0B0E11"
+textColor = "#EEE9DE"
+primaryColor = "#B9975B"
+
+borderColor = "#242724"
+showWidgetBorder = true
+showSidebarBorder = true
+baseRadius = "12px"
+buttonRadius = "10px"
+
+# Semantic slots: green/red drive positive/negative badges, orange is reused as the
+# brass accent for status pills, gray for secondary/muted text.
+greenColor = "#55B88A"
+redColor = "#D36B6B"
+orangeColor = "#B9975B"
+orangeBackgroundColor = "#211D14"
+orangeTextColor = "#D0AE72"
+grayColor = "#A8A49C"
+
+linkColor = "#B9975B"
+linkUnderline = false
+
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "'Fraunces':https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&display=swap"
+baseFontSize = 15
+headingFontSizes = ["30px", "20px", "17px", "16px", "15px", "14px"]
+headingFontWeights = [500, 600, 600, 600, 500, 500]
+
+# Restrained mono for filing metadata / fiscal years / page numbers / ratios --
+# rendered as inline `code` spans so they pick this up with zero custom CSS.
+codeFont = "'IBM Plex Mono':https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap"
+codeFontSize = "0.8125rem"
+codeTextColor = "#D0AE72"
+codeBackgroundColor = "#0E1215"

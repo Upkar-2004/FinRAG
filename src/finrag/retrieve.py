@@ -64,9 +64,17 @@ def reset_collection_cache() -> None:
     _collection = None
 
 
-def retrieve(question: str, k: int = config.TOP_K) -> list[dict]:
+def retrieve(question: str, k: int = config.TOP_K, doc_names: list[str] | None = None) -> list[dict]:
     """Return the top-k chunks most relevant to `question`, searched
-    across the whole corpus (no doc_name filtering).
+    across the whole corpus by default (no doc_name filtering).
+
+    `doc_names`: optional allow-list of config.CORPUS_DOCS keys (e.g.
+    ["AMD_2022_10K"]) to scope the search to specific filings -- an opt-in
+    UI convenience (the demo's sidebar filter), not a change to the
+    default behavior. Still deliberately unfiltered when None/empty: see
+    module docstring for why an unlabeled real question shouldn't be
+    scoped by default, and config.py's doc-scoped-filtering ablation,
+    which measured zero Recall@5 change from filtering.
 
     Each result: {"text": str, "metadata": dict, "similarity": float}.
     Ordered nearest-first (highest similarity first) — this is the order
@@ -78,7 +86,8 @@ def retrieve(question: str, k: int = config.TOP_K) -> list[dict]:
     query_embedding = model.encode(
         [QUERY_PREFIX + question], normalize_embeddings=True
     ).tolist()
-    results = collection.query(query_embeddings=query_embedding, n_results=k)
+    where = {"doc_name": {"$in": doc_names}} if doc_names else None
+    results = collection.query(query_embeddings=query_embedding, n_results=k, where=where)
 
     hits = []
     for doc, meta, dist in zip(
@@ -102,7 +111,9 @@ def retrieve_with_rerank(question: str, k: int = config.TOP_K) -> list[dict]:
     return rerank(question, candidates, k=k)
 
 
-def retrieve_with_expansion(question: str, k: int = config.TOP_K) -> list[dict]:
+def retrieve_with_expansion(
+    question: str, k: int = config.TOP_K, doc_names: list[str] | None = None
+) -> list[dict]:
     """Same shape/contract as retrieve() -- expands the query with
     query_expand.expand_query() first (see that module's docstring for
     why), then searches normally. Matches the "functions as values"
@@ -111,7 +122,7 @@ def retrieve_with_expansion(question: str, k: int = config.TOP_K) -> list[dict]:
     """
     from .query_expand import expand_query
 
-    return retrieve(expand_query(question), k=k)
+    return retrieve(expand_query(question), k=k, doc_names=doc_names)
 
 
 if __name__ == "__main__":
