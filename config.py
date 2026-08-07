@@ -1,33 +1,26 @@
-"""
-Central configuration for the whole project.
+"""Central control panel for FinRAG."""
 
-Why one config file? So that every knob you might change during experiments
-(chunk size, which embedding model, how many chunks to retrieve, which LLM)
-lives in ONE place. When you run your Day-2 ablations, you change a value here
-instead of hunting through five files. Interviewers read this as "this person
-designed for experimentation," which is exactly the signal we want.
-"""
-
+import os  
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
+from dotenv import load_dotenv  # Loads environment variables from a .env file
+
 # Paths
-# ---------------------------------------------------------------------------
-# __file__ is this config.py; .parent is the repo root. Building paths this way
-# means the project works no matter what directory you run it from.
-ROOT = Path(__file__).parent
-DATA_DIR = ROOT / "data"
-PDF_DIR = DATA_DIR / "pdfs"                # the 5 source 10-K PDFs (downloaded, gitignored)
-EVAL_DIR = DATA_DIR / "eval"              # our held-out labeled questions
-VECTORSTORE_DIR = DATA_DIR / "chroma"     # where the vector index persists to disk
+PROJECT_ROOT = Path(__file__).resolve().parent  # The root directory of the project 
+DATA_DIR = PROJECT_ROOT / "data" 
+PDF_DIR = DATA_DIR / "pdfs"  
+EVAL_DIR = DATA_DIR / "eval"  # Contains the evaluation questions and the generated evaluation results
+VECTORSTORE_DIR = DATA_DIR / "chroma"  
+PROCESSED_DIR = DATA_DIR / "processed"
+CHUNKS_PATH = PROCESSED_DIR / "chunks.jsonl"
+MANIFEST_PATH = PROCESSED_DIR / "manifest.json"
 FINANCEBENCH_SRC = DATA_DIR / "_financebench_src"  # cloned source repo (gitignored)
 
-# ---------------------------------------------------------------------------
-# The corpus: which documents we build the assistant over.
-# Keys are the FinanceBench doc_name; values are just a human-friendly label.
-# All FY2022 10-Ks, chosen for sector spread (varied retrieval difficulty).
-# ---------------------------------------------------------------------------
-CORPUS_DOCS = {
+
+# Fixed FinanceBench corpus used by the application and evaluations.
+# Keys match FinanceBench document IDs and PDF filename stems.
+# Values are stored in chunk metadata and displayed as company labels.
+CORPUS_DOCS: dict[str, str] = {
     "AMD_2022_10K": "AMD (semiconductors)",
     "AMERICANEXPRESS_2022_10K": "American Express (financial services)",
     "BOEING_2022_10K": "Boeing (aerospace)",
@@ -35,74 +28,86 @@ CORPUS_DOCS = {
     "3M_2022_10K": "3M (industrials)",
 }
 
-# ---------------------------------------------------------------------------
-# Chunking parameters (used on Day 1).
+
+# Chunking parameters
 # chunk_size = characters per chunk; chunk_overlap = characters shared between
-# neighbours so a sentence split across a boundary isn't lost. These are the
-# FIRST things you'll ablate on Day 2.
-# ---------------------------------------------------------------------------
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 150
+# neighbours so a sentence split across a boundary isn't lost
+CHUNK_SIZE: int = 1000
+CHUNK_OVERLAP: int = 150  # this increases the chance that one chunk preserves the whole sentence
 
-# ---------------------------------------------------------------------------
-# Embedding model (runs locally, free). bge-small is a strong, small model.
+if not 0 <= CHUNK_OVERLAP < CHUNK_SIZE:
+    raise ValueError("CHUNK_OVERLAP must be at least 0 and less than CHUNK_SIZE")
+
+
+# Embedding model (no per request API cost). bge-small is a strong, small model.
 # 384-dimensional vectors, fast on CPU.
-# ---------------------------------------------------------------------------
-EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+EMBEDDING_MODEL: str = "BAAI/bge-small-en-v1.5" #Converts the text into a numerical vector
+EMBEDDING_MODEL_REVISION: str = "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a" # This identifies the specific version
+HF_LOCAL_FILES_ONLY: bool = os.getenv("FINRAG_HF_LOCAL_FILES_ONLY", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+# Both the document chunks and the questions use the same embedding model and configuration.
 
-# ---------------------------------------------------------------------------
-# Retrieval: how many chunks to pull back for a question. Another ablation knob.
-# ---------------------------------------------------------------------------
-TOP_K = 5
+# Final number of retrieved chunks sent to generation
+# Retrieval: how many chunks to pull back for a question
+TOP_K: int = 5
 
-# ---------------------------------------------------------------------------
-# LLM. We default to Groq (fast, free tier, OpenAI-compatible). The Ollama
-# fallback lets the repo run with NO api key at all. Both are wired on Day 1.
-# ---------------------------------------------------------------------------
-LLM_PROVIDER = "groq"                      # "groq" or "ollama"
-GROQ_MODEL = "llama-3.3-70b-versatile"
-OLLAMA_MODEL = "llama3.1:8b"
+if TOP_K <= 0:
+    raise ValueError("TOP_K must be greater than 0.")
 
-# Retrieval-score threshold for the out-of-scope guardrail. Calibrated
-# from real data, not guessed: retrieve_with_expansion()'s in-scope range
-# across all 29 eval questions is ~0.660-0.810 (hits AND misses -- the
-# two overlap heavily, so this threshold can only ever catch OUT-of-scope
-# queries, never distinguish a will-succeed retrieval from a will-fail
-# one on an in-scope question). 7 out-of-scope test questions split into
-# two groups: genuinely unrelated topics (capital of France, baking,
-# weather -- max 0.577) score clearly below the in-scope floor; but
-# "right structure, wrong company" queries (Apple/Google revenue
-# questions -- 0.720, 0.769) score WITHIN the in-scope range and are NOT
-# caught by this guardrail -- a real, documented limitation, not an
-# oversight (docs/finrag_learning_report.md, Section 18). 0.60 sits in
-# the clean gap between the two groups.
-MIN_RELEVANCE_SCORE = 0.60
 
-# ---------------------------------------------------------------------------
-# Reranking: a cross-encoder re-scores a wider dense-retrieval shortlist.
-# ms-marco-MiniLM-L-6-v2 is a small, fast, standard choice for this exact
-# task (trained specifically for query-passage relevance ranking), runs
-# locally, no API cost. RERANK_CANDIDATES is how many dense hits to pull
-# before reranking down to TOP_K -- wide enough to give the cross-encoder
-# real material to work with, narrow enough to stay fast.
-# ---------------------------------------------------------------------------
-RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-RERANK_CANDIDATES = 20
+GROQ_MODEL: str = os.getenv("FINRAG_GROQ_MODEL", "openai/gpt-oss-120b").strip() # This selects the language model to be used after retrieval
+GROQ_REASONING_EFFORT: str = os.getenv("FINRAG_GROQ_REASONING_EFFORT", "low").strip().lower()
+GROQ_TIMEOUT_SECONDS: float = float(os.getenv("FINRAG_GROQ_TIMEOUT_SECONDS", "60"))
+GROQ_MAX_COMPLETION_TOKENS: int = int(os.getenv("FINRAG_GROQ_MAX_COMPLETION_TOKENS", "1600"))
 
-# ---------------------------------------------------------------------------
-# Hybrid retrieval: how many candidates EACH method (dense, BM25) contributes
-# to the RRF fusion pool, before fusing down to TOP_K. Separate knob from
-# RERANK_CANDIDATES -- different mechanism, no reason to couple them.
-#
-# RRF_K: the damping constant in 1/(RRF_K + rank). 60 is the standard
-# value from the original RRF paper (tuned for web search, many largely-
-# agreeing systems). Ablation candidate: a live run showed RRF's default
-# consensus bias (rewarding chunks BOTH methods rank, even weakly) beating
-# out chunks only ONE method confidently found -- exactly the two
-# questions (financebench_id_01226, financebench_id_01009) hybrid
-# retrieval was built to rescue. A smaller K weights top ranks more
-# steeply, which should favor a single method's high-confidence pick over
-# two methods' mediocre agreement -- see scripts/ablate_rrf_k.py.
-# ---------------------------------------------------------------------------
-HYBRID_CANDIDATES = 20
-RRF_K = 60
+if not GROQ_MODEL:
+    raise ValueError("FINRAG_GROQ_MODEL cannot be empty.")
+
+if GROQ_REASONING_EFFORT not in {"low", "medium", "high"}:
+    raise ValueError(
+        "FINRAG_GROQ_REASONING_EFFORT must be low, medium, or high."
+    )
+
+if GROQ_TIMEOUT_SECONDS <= 0:
+    raise ValueError("FINRAG_GROQ_TIMEOUT_SECONDS must be greater than 0.")
+
+if GROQ_MAX_COMPLETION_TOKENS <= 0:
+    raise ValueError(
+        "FINRAG_GROQ_MAX_COMPLETION_TOKENS must be greater than 0."
+    )
+
+# Conservative best-chunk cosine threshold for query-expanded dense retrieval.
+# It rejects weak topical matches; it is not answer confidence.
+MIN_RELEVANCE_SCORE: float = 0.60
+
+if not -1.0 <= MIN_RELEVANCE_SCORE <= 1.0:
+    raise ValueError("MIN_RELEVANCE_SCORE must be between -1.0 and 1.0.")
+
+
+# Putting a retrieve and rerank pipeline to use
+
+# Experimental query-time reranker; not used by the Streamlit default path.
+# Changing this model requires reevaluation but not a Chroma rebuild.
+RERANK_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANK_MODEL_REVISION: str = "c5ee24cb16019beea0893ab7796b1df96625c6b8"
+RERANK_CANDIDATES: int = 20
+
+if RERANK_CANDIDATES < TOP_K:
+    raise ValueError("RERANK_CANDIDATES must be greater than or equal to TOP_K.")
+
+
+# This combines: Dense semantic retrieval + BM25 keyword retrieval 
+# Experimental dense + BM25 fusion; not used by the Streamlit default path.
+# Both settings affect query-time ranking and do not require a Chroma rebuild.
+HYBRID_CANDIDATES: int = 20
+RRF_K: int = 60
+
+if HYBRID_CANDIDATES < TOP_K:
+    raise ValueError("HYBRID_CANDIDATES must be greater than or equal to TOP_K.")
+
+if RRF_K < 0:
+    raise ValueError("RRF_K must be greater than or equal to 0.")
+ 

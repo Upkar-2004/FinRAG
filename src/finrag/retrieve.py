@@ -1,37 +1,29 @@
 """
 Stage 3 — Retrieval: question -> top-k relevant chunks.
-
-Pipeline: embed the question with the same model used for indexing, but
-WITH the BGE query-side instruction prefix this time (passages were
-embedded WITHOUT it in index.py — see that file's docstring for why).
-Query the persisted Chroma collection, convert Chroma's distance to
-similarity (cosine space: similarity = 1 - distance), and return the
-top-k chunks with their metadata and similarity scores.
-
-No relevance guardrail yet. config.MIN_RELEVANCE_SCORE is an unvalidated
-placeholder — it gets calibrated once scripts/evaluate_retrieval.py has
-shown us real similarity-score distributions across the eval set, instead
-of guessed.
-
-Deliberately searches the WHOLE corpus, never filtered to a known
-doc_name — a real user's question doesn't arrive labeled with which
-filing has the answer, so neither does this function. eval_set.jsonl's
-doc_name is only ever used for SCORING a retrieval as a hit or miss, never
-for narrowing what gets searched.
 """
 
+from typing import TypedDict
+
 import chromadb
+from chromadb.errors import NotFoundError
 from sentence_transformers import SentenceTransformer
 
 import config
+
+from .corpus_store import load_manifest
 from .index import COLLECTION_NAME
+from .ingest import ChunkMetadata
 
 QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
-# Lazily-loaded, module-level singletons. retrieve() may be called many
-# times in a row (once per question, in the eval harness) — neither the
-# embedding model nor the Chroma client needs to be recreated per call.
-# Same lesson as the index.py double-load fix, applied here up front.
+
+class RetrievalHit(TypedDict):
+    chunk_id: str
+    text: str
+    metadata: ChunkMetadata
+    similarity: float
+
+
 _model: SentenceTransformer | None = None
 _collection: chromadb.Collection | None = None
 
@@ -39,90 +31,158 @@ _collection: chromadb.Collection | None = None
 def _get_model() -> SentenceTransformer:
     global _model
     if _model is None:
-        _model = SentenceTransformer(config.EMBEDDING_MODEL)
+        _model = SentenceTransformer(
+            config.EMBEDDING_MODEL,
+            revision=config.EMBEDDING_MODEL_REVISION,
+            local_files_only=config.HF_LOCAL_FILES_ONLY,
+        )
     return _model
 
 
 def _get_collection() -> chromadb.Collection:
+
     global _collection
+
     if _collection is None:
         client = chromadb.PersistentClient(path=str(config.VECTORSTORE_DIR))
-        _collection = client.get_collection(COLLECTION_NAME)
+
+        try:
+            _collection = client.get_collection(
+                COLLECTION_NAME,
+                embedding_function=None,
+            )
+        except NotFoundError as error:
+            raise RuntimeError(
+                "The FinRAG vector index was not found. Run `python -m src.finrag.index` first."
+            ) from error
+
     return _collection
 
 
 def reset_collection_cache() -> None:
-    """Force the next retrieve() call to reconnect to the Chroma collection.
 
-    Needed whenever the underlying collection was deleted and rebuilt since
-    the last retrieve() call in this process (e.g. by an ablation script
-    reindexing with different chunk_size settings without restarting
-    Python) — without this, retrieve() would keep querying its cached
-    reference to the now-stale, pre-rebuild collection.
-    """
     global _collection
     _collection = None
 
 
-def retrieve(question: str, k: int = config.TOP_K, doc_names: list[str] | None = None) -> list[dict]:
-    """Return the top-k chunks most relevant to `question`, searched
-    across the whole corpus by default (no doc_name filtering).
+def _validate_collection(collection: chromadb.Collection) -> None:
+    """Ensure Chroma was built from the current corpus and embedding model."""
+    manifest = load_manifest()
+    metadata = collection.metadata or {}
+    expected = {
+        "corpus_fingerprint": manifest["corpus_fingerprint"],
+        "embedding_model": config.EMBEDDING_MODEL,
+        "embedding_revision": config.EMBEDDING_MODEL_REVISION,
+    }
 
-    `doc_names`: optional allow-list of config.CORPUS_DOCS keys (e.g.
-    ["AMD_2022_10K"]) to scope the search to specific filings -- an opt-in
-    UI convenience (the demo's sidebar filter), not a change to the
-    default behavior. Still deliberately unfiltered when None/empty: see
-    module docstring for why an unlabeled real question shouldn't be
-    scoped by default, and config.py's doc-scoped-filtering ablation,
-    which measured zero Recall@5 change from filtering.
+    mismatched = [key for key, value in expected.items() if metadata.get(key) != value]
+    if mismatched:
+        raise RuntimeError(
+            "The Chroma index does not match the current corpus or embedding model. "
+            "Rebuild it with `python -m src.finrag.index`."
+        )
 
-    Each result: {"text": str, "metadata": dict, "similarity": float}.
-    Ordered nearest-first (highest similarity first) — this is the order
-    Chroma's HNSW index already returns them in.
-    """
+
+def retrieve(
+    question: str, k: int | None = None, doc_names: list[str] | None = None
+) -> list[RetrievalHit]:
+    """Return the nearest dense-retrieval chunks for a question"""
+
+    question = question.strip()
+
+    if not question:
+        raise ValueError("Question must not be empty")
+
+    if k is None:
+        k = config.TOP_K
+
+    if k <= 0:
+        raise ValueError("k must be a positive integer")
+
+    if doc_names:
+        valid_doc_names = set(config.CORPUS_DOCS)
+        unknown_doc_names = sorted(set(doc_names) - valid_doc_names)
+        if unknown_doc_names:
+            raise ValueError(
+                f"Unknown doc_names: {unknown_doc_names}. "
+                f"Valid doc_names are: {sorted(valid_doc_names)}"
+            )
+
     model = _get_model()
     collection = _get_collection()
+    _validate_collection(collection)
+
+    collection_count = collection.count()
+    if collection_count <= 0:
+        raise RuntimeError("The FinRAG vector index is empty. Rebuild the index.")
 
     query_embedding = model.encode(
-        [QUERY_PREFIX + question], normalize_embeddings=True
+        [QUERY_PREFIX + question],
+        normalize_embeddings=True,
+        convert_to_numpy=True,
     ).tolist()
     where = {"doc_name": {"$in": doc_names}} if doc_names else None
-    results = collection.query(query_embeddings=query_embedding, n_results=k, where=where)
+    results = collection.query(
+        query_embeddings=query_embedding,
+        n_results=min(k, collection_count),
+        where=where,
+        include=["documents", "metadatas", "distances"],
+    )
 
-    hits = []
-    for doc, meta, dist in zip(
-        results["documents"][0], results["metadatas"][0], results["distances"][0]
+    hits: list[RetrievalHit] = []
+
+    for chunk_id, document, metadata, distance in zip(
+        results["ids"][0],
+        results["documents"][0],
+        results["metadatas"][0],
+        results["distances"][0],
+        strict=True,
     ):
-        hits.append({"text": doc, "metadata": meta, "similarity": 1 - dist})
+        hits.append(
+            {
+                "chunk_id": chunk_id,
+                "text": document,
+                "metadata": metadata,
+                "similarity": 1 - distance,
+            }
+        )
     return hits
 
 
-def retrieve_with_rerank(question: str, k: int = config.TOP_K) -> list[dict]:
-    """Same shape and contract as retrieve() -- {"text","metadata","similarity"}
-    per result -- but widens the dense search to config.RERANK_CANDIDATES
-    first, then has rerank.py's cross-encoder narrow it back down to k.
-    Matches the "functions as values" pattern already used for BM25: this
-    can be passed straight into evaluate_retrieval.py's evaluate(retrieve_fn=...)
-    to score it with the identical harness and hit-scoring rule.
-    """
-    from .rerank import rerank  # local import: avoid loading the cross-encoder for callers that only need plain retrieve()
+def retrieve_with_rerank(
+    question: str, k: int | None = None, doc_names: list[str] | None = None
+) -> list[RetrievalHit]:
 
-    candidates = retrieve(question, k=config.RERANK_CANDIDATES)
+    from .rerank import rerank
+
+    if k is None:
+        k = config.TOP_K
+
+    if k <= 0:
+        raise ValueError("k must be greater than zero.")
+
+    if k > config.RERANK_CANDIDATES:
+        raise ValueError("k cannot exceed RERANK_CANDIDATES when reranking.")
+
+    candidates = retrieve(question, k=config.RERANK_CANDIDATES, doc_names=doc_names)
+
+    if not candidates:
+        return []
+
     return rerank(question, candidates, k=k)
 
 
 def retrieve_with_expansion(
-    question: str, k: int = config.TOP_K, doc_names: list[str] | None = None
-) -> list[dict]:
-    """Same shape/contract as retrieve() -- expands the query with
-    query_expand.expand_query() first (see that module's docstring for
-    why), then searches normally. Matches the "functions as values"
-    pattern already used for BM25/reranked/hybrid retrieval: drops
-    straight into evaluate_retrieval.py's evaluate(retrieve_fn=...).
-    """
+    question: str, k: int | None = None, doc_names: list[str] | None = None
+) -> list[RetrievalHit]:
+    """Expand known financial terms before dense retrieval."""
     from .query_expand import expand_query
 
-    return retrieve(expand_query(question), k=k, doc_names=doc_names)
+    return retrieve(
+        expand_query(question),
+        k=k,
+        doc_names=doc_names,
+    )
 
 
 if __name__ == "__main__":
