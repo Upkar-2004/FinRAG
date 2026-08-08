@@ -37,7 +37,11 @@ _model: CrossEncoder | None = None
 def _get_model() -> CrossEncoder:
     global _model
     if _model is None:
-        _model = CrossEncoder(config.RERANK_MODEL)
+        _model = CrossEncoder(
+            config.RERANK_MODEL,
+            revision=config.RERANK_MODEL_REVISION,
+            local_files_only=config.HF_LOCAL_FILES_ONLY,
+        )
     return _model
 
 
@@ -57,14 +61,16 @@ def rerank(question: str, candidates: list[dict], k: int) -> list[dict]:
     pairs = [[question, c["text"]] for c in candidates]
     scores = model.predict(pairs)
 
-    reranked = sorted(zip(candidates, scores), key=lambda pair: pair[1], reverse=True)
+    reranked = sorted(zip(candidates, scores, strict=True), key=lambda pair: pair[1], reverse=True)
     return [{**c, "similarity": float(score)} for c, score in reranked[:k]]
 
 
 if __name__ == "__main__":
     from .retrieve import retrieve
 
-    question = "Does AMD have a reasonably healthy liquidity profile based on its quick ratio for FY22?"
+    question = (
+        "Does AMD have a reasonably healthy liquidity profile based on its quick ratio for FY22?"
+    )
     candidates = retrieve(question, k=config.RERANK_CANDIDATES)
     print(f"Dense top-5 (of {len(candidates)} candidates considered):")
     for c in candidates[:5]:

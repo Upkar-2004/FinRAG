@@ -5,14 +5,20 @@ filings, grounding every answer in retrieved passages with source citations
 (company, document, page), and using a sandboxed calculator tool for
 derived numbers (ratios, margins, YoY change) that don't appear verbatim in
 the text. Built to be evaluated honestly: retrieval quality and answer
-quality are measured separately, against a held-out labeled question set,
-and every design decision below is backed by a number, not a guess.
+quality are measured separately against a labeled development set. The next
+evaluation milestone is an untouched test set for honest final reporting.
 
-> **Status:** feature-complete. Ingestion, retrieval (6 techniques
-> compared), tool-augmented generation, an out-of-scope guardrail, and a
-> Streamlit demo UI are all built and wired together. See
+> **Status:** complete as a learning prototype, not production-ready.
+> Ingestion, retrieval experiments, tool-augmented generation, a limited
+> out-of-scope guardrail, and a Streamlit demo are wired together. Retrieval
+> currently finds a labeled evidence page in the top five for 11/29 development
+> questions, so fluent output must not be treated as proof of correctness. See
 > [`docs/finrag_learning_report.md`](docs/finrag_learning_report.md) for
-> the full build log — every experiment, bug, and decision, in order.
+> the chronological build log and
+> [`docs/finrag_mastery_guide.md`](docs/finrag_mastery_guide.md) for a
+> concept-by-concept guide to understanding and rebuilding the project. The
+> prioritized findings and remediation status are in
+> [`docs/finrag_deep_audit.md`](docs/finrag_deep_audit.md).
 
 ## What it does
 
@@ -23,7 +29,7 @@ based on its quick ratio for FY22?"* and FinRAG:
    embedding search, expanded with domain vocabulary — see Retrieval below).
 2. Checks the best match's similarity against a calibrated threshold and
    refuses up front if the question is out of scope, instead of guessing.
-3. Sends the retrieved context to an LLM (Groq, `llama-3.3-70b-versatile`)
+3. Sends the retrieved context to an LLM (Groq, `openai/gpt-oss-120b`)
    with a system prompt that requires citing every claim as
    `(Company, page N)` and reaching for a calculator tool — not mental math —
    for any derived number.
@@ -32,12 +38,13 @@ based on its quick ratio for FY22?"* and FinRAG:
 
 ## Results
 
-Retrieval quality, measured as Recall@5 (does any of the top-5 retrieved
-chunks land on a gold answer page) across all 29 held-out FinanceBench
-questions. Six techniques were implemented and measured against the same
-eval set with the same scoring rule:
+Retrieval quality is currently reported as page Hit@5: does any top-five
+chunk come from the correct document and one of its labeled evidence pages?
+The 29 FinanceBench questions have been used repeatedly for diagnosis and
+tuning, so they are now a **development set**, not a clean held-out test set.
+Six techniques were measured with the same scoring rule:
 
-| Technique | Recall@5 |
+| Technique | Page Hit@5 |
 |---|---|
 | **Query expansion (shipped)** | **37.9% (11/29)** |
 | Dense embeddings only (baseline) | 34.5% (10/29) |
@@ -52,6 +59,10 @@ in Section 17 of the learning report, not just reported as negative
 results. Query expansion won because it's the only technique that touches
 the query's vocabulary instead of reprocessing the documents — see
 "Retrieval" below.
+
+The one-question improvement from 10/29 to 11/29 is a useful hypothesis, not
+statistically strong evidence of generalization. A new untouched test set is
+required before making a stronger claim.
 
 ## Retrieval: what was tried, and why the winner won
 
@@ -122,11 +133,8 @@ pip install -r requirements.txt
 # 3. Download the corpus + build the eval set (one command, ~1 min)
 python scripts/prepare_data.py
 
-# 4. LLM access -- pick ONE:
-#    (a) Groq (recommended, free, fast): get a key at https://console.groq.com
+# 4. LLM access through Groq: get a key at https://console.groq.com
 cp .env.example .env               # then paste your key into .env
-#    (b) Fully local, no key: install Ollama (https://ollama.com) then:
-#        ollama pull llama3.1:8b
 
 # 5. Build the vector index (parses PDFs, chunks, embeds, persists to Chroma)
 python -m src.finrag.index
@@ -151,21 +159,54 @@ src/finrag/
   generate.py                      # tool-augmented generation + guardrail
 scripts/
   prepare_data.py                  # download corpus + build eval set
-  evaluate_retrieval.py            # Recall@5 for dense-only
+  evaluate_retrieval.py            # page Hit@5 for dense-only
   evaluate_bm25.py, evaluate_hybrid.py,
   evaluate_rerank.py, evaluate_query_expansion.py
   evaluate_generation.py           # citation/groundedness checks on generated answers
   ablate_chunking.py, ablate_rrf_k.py
 docs/finrag_learning_report.md     # the full build log: every experiment, bug, decision
+docs/finrag_mastery_guide.md       # concept map, exercises, and learning path
 data/                               # downloaded/generated, gitignored
 ```
 
+## Developer checks
+
+Install the development tools once, then run the same checks before each
+meaningful change:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+ruff check .
+ruff format --check .
+# See the documented local-only Chroma exception below.
+pip-audit --ignore-vuln PYSEC-2026-311
+```
+
+Set `FINRAG_HF_LOCAL_FILES_ONLY=1` when you want embedding and reranker model
+loading to fail fast instead of attempting a network download. The Groq model
+can be overridden with `FINRAG_GROQ_MODEL`; keeping the default is recommended
+because token pricing and supported parameters are model-specific.
+
 ## What's left
 
-- **Generation-quality eval hasn't been run to completion** — the script
-  (`scripts/evaluate_generation.py`) is built and measures citation
-  formatting, groundedness, and whether the cited page matches the gold
-  page, but no results have been saved yet.
-- **Latency/cost logging** isn't built yet — currently in progress.
-- Full LLM-generated HyDE, generalizing query expansion beyond 5 hand-mapped
-  metrics, is the natural next step for retrieval.
+- **Generation-quality evaluation is partial** — 19/29 rows are saved locally,
+  but answer-content correctness is not yet scored and the model migration
+  requires a fresh run.
+- **The evaluation design needs a clean split** — the existing 29 questions
+  influenced system design and must be treated as development data.
+- **Reproducibility needs hardening** — pin the FinanceBench revision and model
+  revision, add a dependency lockfile, and fingerprint the persisted index.
+- **Retrieval remains the main bottleneck** — prioritize company routing,
+  page/section diversity, multi-query decomposition, and structured statement
+  extraction before adding more generic retrieval layers.
+- **Telemetry exists** for latency, token use, estimated cost, and failures;
+  privacy controls and request-level correlation are still needed before
+  deployment.
+- **Chroma must remain embedded/local-only for now** — the current PyPI release
+  has an unfixed pre-authentication code-injection advisory in its HTTP server
+  (`PYSEC-2026-311` / `CVE-2026-45829`). FinRAG uses `PersistentClient`
+  in-process and does not start or expose that server. The audit command ignores
+  only this named, documented exception so new findings still fail the check.
+  Remove the exception when Chroma publishes a fixed release, and re-audit
+  before any deployment or architectural change.

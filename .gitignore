@@ -10,4 +10,8 @@ venv/
 # Vector store / caches
 *.sqlite3
 .cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .DS_Store

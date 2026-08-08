@@ -24,27 +24,25 @@ import config
 
 TELEMETRY_PATH = config.DATA_DIR / "telemetry.jsonl"
 
-# Groq pricing, USD per 1M tokens. Deliberately left unset rather than
-# guessed -- this report's whole ethos (see its header) is that every
-# number is either actually measured or explicitly marked unmeasured, and
-# a hardcoded price is exactly the kind of thing that goes stale silently.
-# Check current rates at https://groq.com/pricing/ for GROQ_MODEL
-# (config.py) and fill these in yourself; estimate_cost_usd() returns
-# None until you do, instead of quietly reporting a wrong dollar figure.
-GROQ_PRICE_PER_M_INPUT_TOKENS: float | None = None
-GROQ_PRICE_PER_M_OUTPUT_TOKENS: float | None = None
+# On-demand Groq pricing in USD per 1M tokens, verified 2026-08-03.
+# Keep pricing keyed by model so historical telemetry is not silently
+# recalculated with the current default model's rates.
+GROQ_PRICING_USD_PER_M_TOKENS: dict[str, tuple[float, float]] = {
+    "openai/gpt-oss-120b": (0.15, 0.60),
+    "llama-3.3-70b-versatile": (0.59, 0.79),
+}
 
 
-def estimate_cost_usd(prompt_tokens: int, completion_tokens: int) -> float | None:
-    """None (not 0.0) if pricing hasn't been filled in above -- 0.0 would
-    silently look like "this call was free," which is a much worse wrong
-    answer than an honest "unknown"."""
-    if GROQ_PRICE_PER_M_INPUT_TOKENS is None or GROQ_PRICE_PER_M_OUTPUT_TOKENS is None:
+def estimate_cost_usd(
+    prompt_tokens: int, completion_tokens: int, *, model: str | None = None
+) -> float | None:
+    """Estimate on-demand token cost, or return None for an unknown model."""
+    model = model or config.GROQ_MODEL
+    pricing = GROQ_PRICING_USD_PER_M_TOKENS.get(model)
+    if pricing is None:
         return None
-    return (
-        prompt_tokens * GROQ_PRICE_PER_M_INPUT_TOKENS
-        + completion_tokens * GROQ_PRICE_PER_M_OUTPUT_TOKENS
-    ) / 1_000_000
+    input_price, output_price = pricing
+    return (prompt_tokens * input_price + completion_tokens * output_price) / 1_000_000
 
 
 def _append(record: dict) -> None:
@@ -73,6 +71,11 @@ def timed(stage: str, **fields):
     start = time.perf_counter()
     try:
         yield record
+    except Exception as exc:
+        record["succeeded"] = False
+        record["error_type"] = type(exc).__name__
+        raise
     finally:
+        record.setdefault("succeeded", True)
         record["latency_ms"] = round((time.perf_counter() - start) * 1000, 1)
         _append(record)
